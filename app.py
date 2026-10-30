@@ -1,5 +1,6 @@
 """أرشيف مدرسة أم المؤمنين — server-only Supabase access, private storage."""
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -7,7 +8,7 @@ import os
 import re
 import secrets
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache, wraps
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -876,6 +877,281 @@ def export_all():
     teachers = sorted(teachers, key=lambda t: t["full_name"])[start:start+count]
     return Response(stream_with_context(archive_stream(teachers, output_format)), mimetype="application/zip",
                     headers={"Content-Disposition": "attachment; filename=school_archive.zip", "Cache-Control": "no-store"})
+
+
+
+# V8: durable export history (same dedicated Supabase project, no other projects touched).
+# Run migration_v8.sql ONCE inside umm-school-archive-db before using this feature.
+def export_inventory(status="all", output_format="folders"):
+    """Classify each teacher by the VERSION ACTUALLY CONFIRMED as downloaded.
+
+    Scanning a new document, changing its pages, deleting a document or
+    renaming a teacher changes its fingerprint and will label it UPDATED.
+    History is per output format because a folder ZIP differs from merged PDF.
+    """
+    if status not in ("all", "complete", "incomplete") or output_format not in ("folders", "pdf"):
+        raise UserError("فلتر أو نوع تصدير غير صحيح")
+    teachers = all_records("teachers", "id,full_name,national_id,position")
+    documents = all_records("documents", "teacher_id,kind,storage_path,version")
+    grouped = {}
+    for doc in documents:
+        grouped.setdefault(doc["teacher_id"], {})[doc["kind"]] = doc
+    try:
+        exported = table("export_history").select("teacher_id,output_format,fingerprint,exported_at").eq(
+            "output_format", output_format).execute().data or []
+    except Exception:
+        app.logger.exception("Missing or inaccessible export history table")
+        raise UserError("جدول متابعة التصدير غير جاهز. نفّذ migration_v8.sql في مشروع الأرشفة الجديد فقط.", 503)
+    indexed = {row["teacher_id"]: row for row in exported}
+    result, empty = [], 0
+    for teacher in sorted(teachers, key=lambda t: t["full_name"]):
+        td = grouped.get(teacher["id"], {})
+        n = len(td)
+        if status == "complete" and n != 5:
+            continue
+        if status == "incomplete" and n == 5:
+            continue
+        if not n:
+            empty += 1
+            continue   # no empty ZIP folders and no false 'downloaded' marks
+        parts = [[k, int(td[k].get("version") or 1), td[k]["storage_path"]] for k in KINDS if k in td]
+        raw = json.dumps([teacher["full_name"], teacher["national_id"], parts],
+                         ensure_ascii=False, separators=(",", ":"))
+        fingerprint = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        prev = indexed.get(teacher["id"])
+        kind = ("new" if not prev else
+                "previous" if prev["fingerprint"] == fingerprint else "updated")
+        result.append({
+            "id": teacher["id"], "name": teacher["full_name"], "document_count": n,
+            "missing": [label for key, label in KINDS.items() if key not in td],
+            "fingerprint": fingerprint, "download_state": kind,
+            "exported_at": prev.get("exported_at") if prev else None,
+        })
+    return result, empty
+
+
+def export_summary(items, empty=0):
+    return {
+        "new": sum(x["download_state"] == "new" for x in items),
+        "updated": sum(x["download_state"] == "updated" for x in items),
+        "previous": sum(x["download_state"] == "previous" for x in items),
+        "empty": empty,
+        "total": len(items),
+    }
+
+
+@app.get("/api/export/preview")
+@login_required(roles=("admin",))
+def preview_export():
+    output_format = request.args.get("format", "folders")
+    items, empty = export_inventory(request.args.get("status", "all"), output_format)
+    # Do not expose fingerprint or full ID unnecessarily in an informational preview.
+    return jsonify(summary=export_summary(items, empty),
+                   items=[{k: v for k, v in item.items() if k != "fingerprint"} for item in items])
+
+
+@app.post("/api/export/prepare")
+@login_required(roles=("admin",))
+def prepare_export():
+    args = request.get_json(silent=True) or {}
+    status, fmt = args.get("status", "all"), args.get("format", "folders")
+    selection = args.get("selection", "pending")
+    if selection not in ("pending", "all", "new", "updated", "previous"):
+        raise UserError("اختيار التنزيل غير صحيح")
+    try:
+        start = max(0, int(args.get("start", 0)))
+        count = max(1, min(400, int(args.get("count", 50))))
+    except (TypeError, ValueError):
+        raise UserError("حدود الدفعة غير صحيحة")
+    items, empty = export_inventory(status, fmt)
+    if selection == "pending":
+        items = [i for i in items if i["download_state"] in ("new", "updated")]
+    elif selection != "all":
+        items = [i for i in items if i["download_state"] == selection]
+    chosen = items[start:start + count]
+    if not chosen:
+        raise UserError("لا توجد ملفات جديدة في هذه الدفعة. اختر الكل إذا أردت تنزيل الملفات السابقة أيضًا.")
+    payload = [{"id": item["id"], "fingerprint": item["fingerprint"]} for item in chosen]
+    new_batch = {
+        "actor_id": request.current_user["id"], "output_format": fmt,
+        "payload": payload,
+    }
+    try:
+        result = table("export_batches").insert(new_batch).execute().data[0]
+    except Exception:
+        app.logger.exception("Could not prepare export batch")
+        raise UserError("تعذر تجهيز التصدير. تأكد من تشغيل migration_v8.sql داخل مشروع الأرشفة.", 503)
+    return jsonify(batch_id=result["id"], count=len(chosen),
+                   summary=export_summary(chosen), names=[i["name"] for i in chosen[:10]])
+
+
+def user_batch(batch_id):
+    rows = table("export_batches").select("*").eq("id", uid(batch_id)).limit(1).execute().data or []
+    if not rows or rows[0]["actor_id"] != request.current_user["id"]:
+        raise UserError("دفعة تنزيل غير موجودة لهذا الحساب", 404)
+    batch = rows[0]
+    created = datetime.fromisoformat(batch["created_at"].replace("Z", "+00:00"))
+    if (datetime.now(timezone.utc) - created).total_seconds() > 48 * 3600:
+        raise UserError("انتهت صلاحية هذا التنزيل. جهّز دفعة جديدة.", 410)
+    return batch
+
+
+@app.get("/api/export/batch/<batch_id>.zip")
+@login_required(roles=("admin",))
+def get_export_batch(batch_id):
+    batch = user_batch(batch_id)
+    ids = {row["id"] for row in batch["payload"]}
+    all_teachers = all_records("teachers", "id,full_name,national_id,position")
+    grouped = {t["id"]: t for t in all_teachers}
+    chosen = [grouped[row["id"]] for row in batch["payload"] if row["id"] in grouped]
+    if not chosen:
+        raise UserError("لم تعد هذه الدفعة تحتوي على ملفات", 404)
+    name = "school_archive_" + datetime.now(timezone.utc).strftime("%Y%m%d") + ".zip"
+    return Response(stream_with_context(archive_stream(chosen, batch["output_format"])),
+                    mimetype="application/zip", headers={
+                        "Content-Disposition": f"attachment; filename={name}",
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                    })
+
+
+@app.post("/api/export/confirm")
+@login_required(roles=("admin",))
+def confirm_export():
+    args = request.get_json(silent=True) or {}
+    batch = user_batch(args.get("batch_id"))
+    if batch.get("confirmed_at"):
+        return jsonify(ok=True, count=0, already_confirmed=True)
+    stamp = datetime.now(timezone.utc).isoformat()
+    # Only confirm the snapshot on the server. Changes made during download
+    # remain labelled 'updated' at the next export instead of being lost.
+    rows = [{
+        "teacher_id": row["id"], "output_format": batch["output_format"],
+        "fingerprint": row["fingerprint"], "exported_at": stamp,
+        "exported_by": request.current_user["id"],
+    } for row in batch["payload"]]
+    if not rows:
+        raise UserError("دفعة فارغة")
+    # If another phone confirmed a NEWER download, avoid overwriting that
+    # history with an older export batch.
+    existing = table("export_history").select("teacher_id,exported_at").eq(
+        "output_format", batch["output_format"]).in_(
+        "teacher_id", [r["teacher_id"] for r in rows]).execute().data or []
+    newer = {row["teacher_id"] for row in existing if row["exported_at"] and
+             datetime.fromisoformat(row["exported_at"].replace("Z", "+00:00")) >
+             datetime.fromisoformat(batch["created_at"].replace("Z", "+00:00"))}
+    rows = [r for r in rows if r["teacher_id"] not in newer]
+    if rows:
+        table("export_history").upsert(rows, on_conflict="teacher_id,output_format").execute()
+    table("export_batches").update({"confirmed_at": stamp}).eq("id", batch["id"]).is_("confirmed_at", "null").execute()
+    audit("تأكيد تنزيل الأرشيف", f"{len(batch['payload'])} معلم • الصيغة: {batch['output_format']}")
+    return jsonify(ok=True, count=len(batch["payload"]))
+
+
+@app.post("/api/export/mark-existing")
+@login_required(roles=("admin",))
+def mark_exports_before_upgrade():
+    """Admin may tag folders that were saved to the phone BEFORE V8 tracking."""
+    data = request.get_json(silent=True) or {}
+    fmt = data.get("format", "folders")
+    ids = data.get("teacher_ids", [])
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 400 or len(set(ids)) != len(ids):
+        raise UserError("اختر معلمًا واحدًا على الأقل، بحد أقصى 400")
+    inventory, _ = export_inventory("all", fmt)
+    indexed = {item["id"]: item for item in inventory}
+    if any(teacher_id not in indexed for teacher_id in ids):
+        raise UserError("أحد المعلمين غير موجود أو ليس لديه مستندات")
+    stamp = datetime.now(timezone.utc).isoformat()
+    rows = [{
+        "teacher_id": teacher_id, "output_format": fmt,
+        "fingerprint": indexed[teacher_id]["fingerprint"],
+        "exported_at": stamp, "exported_by": request.current_user["id"],
+    } for teacher_id in ids]
+    table("export_history").upsert(rows, on_conflict="teacher_id,output_format").execute()
+    audit("تسجيل ملفات نُزّلت سابقًا", f"{len(ids)} معلم • الصيغة: {fmt}")
+    return jsonify(ok=True, count=len(ids))
+
+
+
+# V8 notification center: audit data + account-level read pointer, no public document URLs.
+DOCUMENT_EVENT_ACTIONS = (
+    "تصوير مستند", "تعديل مستند", "استبدال صفحة", "حذف صفحة",
+    "حذف مستند", "تحسين وضوح PDF",
+)
+
+
+def document_notifications():
+    # Supabase order by server timestamp; never expose events to scanner roles.
+    history = (table("logs")
+               .select("id,actor_name,action,details,created_at")
+               .in_("action", list(DOCUMENT_EVENT_ACTIONS))
+               .order("created_at", desc=True).limit(120).execute().data or [])
+    teacher_id_re = re.compile(r"(?:^|\s|\|)ID:([0-9a-fA-F-]{36})(?:$|\s|\|)")
+    notifications = []
+    for row in history:
+        details = row.get("details") or ""
+        ident = teacher_id_re.search(details)
+        # The teacher record may be deleted later; display historical name anyway.
+        name = re.search(r"معلم:\s*([^|]+)", details)
+        kind = re.search(r"مستند:\s*([^|]+)", details)
+        notifications.append({
+            "id": row["id"], "action": row["action"],
+            "actor": row.get("actor_name") or "النظام",
+            "teacher_name": name.group(1).strip() if name else "اسم المعلم غير متوفر في السجل القديم",
+            "teacher_id": ident.group(1) if ident else None,
+            "kind": kind.group(1).strip() if kind else "",
+            "created_at": row["created_at"],
+        })
+    return notifications
+
+
+@app.get("/api/notifications")
+@login_required(roles=("admin",))
+def notifications():
+    entries = document_notifications()
+    actor_id = request.current_user["id"]
+    history = (table("notification_reads").select("last_seen_at")
+               .eq("user_id", actor_id).limit(1).execute().data or [])
+    if not history:
+        # Historical activity remains visible, but it does not cause a fake
+        # avalanche of old notifications when the feature is first installed.
+        # Keep activities from the last 24 hours visible as new.
+        initial = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        table("notification_reads").upsert({
+            "user_id": actor_id, "last_seen_at": initial,
+        }, on_conflict="user_id").execute()
+        read_at = initial
+    else:
+        read_at = history[0]["last_seen_at"]
+    last_read_dt = datetime.fromisoformat(read_at.replace("Z", "+00:00"))
+    unread = sum(datetime.fromisoformat(event["created_at"].replace("Z", "+00:00")) > last_read_dt
+                 for event in entries)
+    return jsonify(items=entries, unread=unread, last_seen_at=read_at)
+
+
+@app.post("/api/notifications/read")
+@login_required(roles=("admin",))
+def mark_notifications_read():
+    # Mark the events that are actually visible, not future events.
+    data = request.get_json(silent=True) or {}
+    through = data.get("through")
+    if not isinstance(through, str):
+        raise UserError("حدد الإشعار الذي شاهدته")
+    try:
+        stamp = datetime.fromisoformat(through.replace("Z", "+00:00"))
+    except ValueError:
+        raise UserError("تاريخ الإشعار غير صحيح")
+    if stamp.tzinfo is None or stamp > datetime.now(timezone.utc):
+        raise UserError("تاريخ الإشعار غير صحيح")
+    actor_id = request.current_user["id"]
+    old = (table("notification_reads").select("last_seen_at")
+           .eq("user_id", actor_id).limit(1).execute().data or [])
+    if old and datetime.fromisoformat(old[0]["last_seen_at"].replace("Z", "+00:00")) >= stamp:
+        return jsonify(ok=True)
+    table("notification_reads").upsert({
+        "user_id": actor_id, "last_seen_at": stamp.isoformat(),
+    }, on_conflict="user_id").execute()
+    return jsonify(ok=True)
 
 
 @app.post("/api/users")
