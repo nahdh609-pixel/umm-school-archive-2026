@@ -1,6 +1,7 @@
 """أرشيف مدرسة أم المؤمنين — server-only Supabase access, private storage."""
 import csv
 import io
+import json
 import logging
 import os
 import re
@@ -433,96 +434,146 @@ def detect_page(im):
     return im, False
 
 
-def pdf_from_image(image, mode="scan", automatic_crop=True):
-    """Create a printable A4 PDF from a real image, preserving page details.
+def manual_crop_image(image, corners):
+    """Crop and straighten a page from four normalized corners [TL,TR,BR,BL].
 
-    scan: brighter paper and darker lettering (recommended for school files).
-    clear: gentle gray normalization for delicate handwriting.
-    color: preserves stamps and pen colors.
-    bw: high-contrast black/white; may lose faint handwriting.
-    Camera blur cannot be restored by artificial upscaling.
+    The points come from the authenticated browser after the employee positions
+    draggable handles. The original image pixels are processed on the server.
+    """
+    if not isinstance(corners, list) or len(corners) != 4:
+        raise UserError("حدد زوايا الورقة الأربع بصورة صحيحة")
+    try:
+        pts = np.asarray(corners, dtype=np.float32)
+    except (TypeError, ValueError):
+        raise UserError("إحداثيات قص الورقة غير صحيحة")
+    if pts.shape != (4, 2) or not np.isfinite(pts).all() or (pts < 0).any() or (pts > 1).any():
+        raise UserError("إحداثيات القص خارج حدود الصورة")
+    width, height = image.size
+    pts *= np.array([width - 1, height - 1], dtype=np.float32)
+    # Reorder points after any 90-degree rotation performed by the browser.
+    sm = pts.sum(axis=1)
+    df = np.diff(pts, axis=1).reshape(-1)
+    tl, tr, br, bl = pts[np.argmin(sm)], pts[np.argmin(df)], pts[np.argmax(sm)], pts[np.argmax(df)]
+    ordered = np.array([tl, tr, br, bl], dtype=np.float32)
+    area = abs(cv2.contourArea(ordered))
+    if area < width * height * .015:
+        raise UserError("منطقة القص صغيرة جدًا، حدّد حدود الورقة كاملة")
+    new_width = round(max(np.linalg.norm(tr-tl), np.linalg.norm(br-bl)))
+    new_height = round(max(np.linalg.norm(bl-tl), np.linalg.norm(br-tr)))
+    if min(new_width, new_height) < 300:
+        raise UserError("منطقة القص صغيرة جدًا لقراءة المستند")
+    # Bound memory on free Render, keep good native resolution for print.
+    sf = min(1., 3000 / max(new_width, new_height))
+    new_width, new_height = round(new_width * sf), round(new_height * sf)
+    dest = np.float32([[0, 0], [new_width - 1, 0],
+                       [new_width - 1, new_height - 1], [0, new_height - 1]])
+    matrix = cv2.getPerspectiveTransform(ordered, dest)
+    result = cv2.warpPerspective(np.asarray(image.convert('RGB')), matrix,
+                                 (new_width, new_height), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT,
+                                 borderValue=(255, 255, 255))
+    return Image.fromarray(result)
+
+
+def pdf_from_image(image, mode="scan", automatic_crop=True, manual_points=None):
+    """Create a legible, compact A4 PDF quickly, avoiding dark page output.
+
+    The paper is corrected using a background illumination map. Ink is kept
+    dark, but faint handwritten strokes are not blindly thresholded away.
+    An A4-size raster does not magically increase optical camera detail.
     """
     if mode not in ("scan", "clear", "color", "bw"):
         raise UserError("نمط التحسين غير صحيح")
     image = ImageOps.exif_transpose(image).convert("RGB")
-    if min(image.size) < 650:
-        raise UserError("دقة الصورة ضعيفة. قرّب الهاتف وأعد التصوير.")
-    if max(image.size) > 3400:
-        image.thumbnail((3400, 3400), Image.Resampling.LANCZOS)
+    if min(image.size) < 500:
+        raise UserError("الصورة صغيرة أو بعيدة جدًا؛ قرّب الهاتف وأعد التصوير")
+    if max(image.size) > 3200:
+        image.thumbnail((3200, 3200), Image.Resampling.LANCZOS)
     cropped = False
-    if automatic_crop:
+    if manual_points is not None:
+        image = manual_crop_image(image, manual_points)
+        cropped = True
+    elif automatic_crop:
         image, cropped = detect_page(image)
-    rgb = np.asarray(image.convert("RGB"))
+    rgb = np.asarray(image)
     if mode == "color":
+        # Gentle correction keeps coloured stamps and ink visible.
         lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-        light, ca, cb = cv2.split(lab)
-        light = cv2.createCLAHE(clipLimit=1.25, tileGridSize=(8, 8)).apply(light)
-        balanced = cv2.cvtColor(cv2.merge((light, ca, cb)), cv2.COLOR_LAB2RGB)
-        processed = Image.fromarray(balanced).filter(ImageFilter.UnsharpMask(radius=.8, percent=85, threshold=3))
+        l, a, b = cv2.split(lab)
+        l = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8)).apply(l)
+        processed = Image.fromarray(cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2RGB))
     else:
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        hh, ww = gray.shape
-        ratio = min(1.0, 460.0 / max(hh, ww))
-        bg_small = cv2.resize(gray, (max(40, round(ww * ratio)), max(40, round(hh * ratio))), interpolation=cv2.INTER_AREA)
-        bg_small = cv2.GaussianBlur(bg_small, (0, 0), sigmaX=16)
-        bg = cv2.resize(bg_small, (ww, hh), interpolation=cv2.INTER_LINEAR)
-        bg = np.maximum(bg, 65)
-        neutral = cv2.divide(gray, bg, scale=250)
+        h, w = gray.shape
+        # Estimate page lighting at low resolution: fast even on free Render.
+        factor = min(1.0, 850 / max(h, w))
+        small = cv2.resize(gray, (max(50, round(w*factor)), max(50, round(h*factor))),
+                           interpolation=cv2.INTER_AREA) if factor < 1 else gray
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (33, 33))
+        background = cv2.morphologyEx(small, cv2.MORPH_CLOSE, kernel)
+        background = cv2.GaussianBlur(background, (0, 0), sigmaX=13)
+        bg = cv2.resize(background, (w, h), interpolation=cv2.INTER_LINEAR)
+        # Remove shadows even on very dark mobile photos.
+        norm = cv2.divide(gray, np.maximum(bg, 15), scale=253)
         if mode == "bw":
-            # For documents without delicate handwriting or light ink stamps.
-            neutral = cv2.adaptiveThreshold(neutral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                             cv2.THRESH_BINARY, 41, 13)
+            result = cv2.adaptiveThreshold(norm, 255,
+                        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 13)
         else:
-            ink = 255.0 - neutral.astype(np.float32)
-            strength = 1.50 if mode == "scan" else 1.16
-            result = np.clip(255.0 - ink * strength, 0.0, 255.0)
-            if mode == "scan":
-                # A soft highlight lift whitens the sheet while preserving faint writing.
-                highlight = np.clip((result - 237.0) / 18.0, 0.0, 1.0)
-                result += (255.0 - result) * highlight * 0.82
-            neutral = np.clip(result, 0, 255).astype(np.uint8)
-        processed = Image.fromarray(neutral).filter(
-            ImageFilter.UnsharpMask(radius=.65, percent=95 if mode == "scan" else 80, threshold=2))
-    # A4 portrait, 300 DPI canvas, never promise 300 DPI *optical* detail.
-    sheet_w, sheet_h = 2480, 3508
-    margin = 82
+            # Normalize background to paper white, preserve pale text.
+            strength = 1.18 if mode == "scan" else 1.07
+            result = np.clip((norm.astype(np.float32) - 215) * strength + 226,
+                             0, 255).astype(np.uint8)
+            # A gentle sharpen avoids black bands and crushed handwriting.
+        processed = Image.fromarray(result).filter(
+            ImageFilter.UnsharpMask(radius=.55, percent=75, threshold=3))
+    # 230 dpi A4 gives clear text with faster conversion, smaller uploads and
+    # smaller PDFs than re-encoding every sheet at 300 dpi and quality 96.
+    sheet_w, sheet_h = 1901, 2688
+    margin = 38
     if processed.width > processed.height:
         processed = processed.rotate(90, expand=True)
-    avail_w, avail_h = sheet_w - 2 * margin, sheet_h - 2 * margin
-    factor = min(avail_w / processed.width, avail_h / processed.height)
-    new_size = (max(1, round(processed.width * factor)), max(1, round(processed.height * factor)))
-    processed = processed.resize(new_size, Image.Resampling.LANCZOS if factor < 1 else Image.Resampling.BICUBIC)
+    avail_w, avail_h = sheet_w - 2*margin, sheet_h - 2*margin
+    s = min(avail_w / processed.width, avail_h / processed.height)
+    new_size = (max(1, round(processed.width*s)), max(1, round(processed.height*s)))
+    processed = processed.resize(new_size, Image.Resampling.LANCZOS if s < 1 else Image.Resampling.BICUBIC)
     sheet = Image.new("RGB" if mode == "color" else "L", (sheet_w, sheet_h), "white")
     sheet.paste(processed, ((sheet_w-new_size[0])//2, (sheet_h-new_size[1])//2))
     out = io.BytesIO()
-    sheet.save(out, format="PDF", resolution=300, quality=96)
+    sheet.save(out, format="PDF", resolution=230, quality=87)
     return out.getvalue(), cropped
 
 
-def image_pdf(data, mode="scan"):
+def image_pdf(data, mode="scan", points=None):
     if len(data) > MAX_IMAGE:
         raise UserError("حجم الصورة يتجاوز 12 ميغابايت")
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
-        return pdf_from_image(im, mode)
+        return pdf_from_image(im, mode, manual_points=points,
+                              automatic_crop=points is None)
     except (ValueError, OSError, Image.DecompressionBombError):
         raise UserError("تعذر فتح الصورة؛ استخدم JPG أو PNG")
 
 
-def images_as_pdf(files, mode="scan"):
+def images_as_pdf(files, mode="scan", points_json=None):
     if not files or len(files) > 20:
         raise UserError("اختَر من 1 إلى 20 صورة في كل مرة")
-    writer, auto_crop_count = PdfWriter(), 0
-    for f in files:
+    try:
+        points_list = json.loads(points_json) if points_json else [None] * len(files)
+    except (json.JSONDecodeError, TypeError):
+        raise UserError("تعذر قراءة حدود قص الصورة")
+    if not isinstance(points_list, list) or len(points_list) != len(files):
+        raise UserError("عدد حدود القص لا يطابق عدد الصور")
+    writer, cropped_count = PdfWriter(), 0
+    for f, points in zip(files, points_list):
         if not (f.mimetype or "").startswith("image/"):
             raise UserError("يُسمح برفع الصور فقط")
-        pdf, auto = image_pdf(f.read(MAX_IMAGE + 1), mode=mode)
-        auto_crop_count += int(auto)
+        pdf, cropped = image_pdf(f.read(MAX_IMAGE + 1), mode, points)
+        cropped_count += int(cropped)
         writer.append(io.BytesIO(pdf))
     out = io.BytesIO()
     writer.write(out)
-    return out.getvalue(), auto_crop_count
+    return out.getvalue(), cropped_count
 
 
 def merge_pdfs(existing_pdf, new_pdf, mode, page_index=None):
@@ -594,7 +645,7 @@ def upload_doc(teacher_id, kind):
     teacher = teacher_by_id(teacher_id)
     if kind not in KINDS:
         raise UserError("نوع المستند غير معروف")
-    new_pdf, cropped = images_as_pdf(request.files.getlist("images"), request.form.get("quality", "scan"))
+    new_pdf, cropped = images_as_pdf(request.files.getlist("images"), request.form.get("quality", "scan"), request.form.get("crop_points"))
     mode = request.form.get("mode", "append")
     old = find_doc(teacher_id, kind)
     # Photographers can fix any teacher document; admin controls management/exports.
@@ -625,7 +676,7 @@ def replace_page(doc_id, page):
     imgs = request.files.getlist("images")
     if len(imgs) != 1:
         raise UserError("اختَر صورة واحدة للاستبدال")
-    pdf, cropped = images_as_pdf(imgs, request.form.get("quality", "scan"))
+    pdf, cropped = images_as_pdf(imgs, request.form.get("quality", "scan"), request.form.get("crop_points"))
     updated = merge_pdfs(storage().download(doc["storage_path"]), pdf, "replace_page", page)
     saved = save_doc(doc["teacher_id"], doc["kind"], updated, doc["pages"], doc)
     audit("استبدال صفحة", f"{doc['kind']} - صفحة {page+1}")
