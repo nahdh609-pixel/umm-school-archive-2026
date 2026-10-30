@@ -225,11 +225,11 @@ def me():
 @login_required()
 def state():
     role = request.current_user["role"]
-    # A photography-only user may choose from existing teachers and see which
-    # documents still need scanning; they cannot access national IDs, PDFs,
-    # exports, staff activity logs, or account management.
+    # Scanner can search existing teachers and correct his/her own scans, but
+    # cannot access national IDs, other users' PDFs, exports or management.
     teacher_fields = "id,full_name,position" if role == "scanner" else "id,full_name,national_id,position,created_at"
-    document_fields = "teacher_id,kind" if role == "scanner" else "id,teacher_id,kind,pages,version,created_at,updated_at"
+    document_fields = ("id,teacher_id,kind,pages,version,uploaded_by" if role == "scanner"
+                       else "id,teacher_id,kind,pages,version,uploaded_by,created_at,updated_at")
     teachers = all_records("teachers", teacher_fields)
     docs = all_records("documents", document_fields, "created_at")
     logs = []
@@ -374,6 +374,32 @@ def get_doc(id_):
     return found[0]
 
 
+def require_document_editor(doc):
+    """Scanner may correct/delete only docs last saved by their own account.
+
+    This also allows different phones logged in to the same account to correct
+    that account's scans. Other users' documents remain admin-only.
+    """
+    actor = request.current_user
+    if actor["role"] == "admin":
+        return
+    if actor["role"] == "scanner" and doc.get("uploaded_by") == actor["id"]:
+        return
+    raise UserError("لا يمكنك تعديل مستند صوّره مستخدم آخر؛ تواصل مع المدير.", 403)
+
+
+def check_document_version(doc, raw, required=False):
+    if raw in (None, ""):
+        if required:
+            raise UserError("حدّث الصفحة أولًا قبل تعديل هذا المستند.", 409)
+        return
+    try:
+        expected = int(raw)
+    except (ValueError, TypeError):
+        raise UserError("رقم نسخة المستند غير صحيح")
+    if doc["version"] != expected:
+        raise UserError("المستند تغيّر من جهاز آخر. حدّث قائمة المعلمين ثم أعد المحاولة.", 409)
+
 def detect_page(im):
     """Attempt 4-corner perspective correction. Fallback retains full image."""
     rgb = np.array(im.convert("RGB"))
@@ -386,7 +412,8 @@ def detect_page(im):
     for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:8]:
         perimeter = cv2.arcLength(cnt, True)
         pts = cv2.approxPolyDP(cnt, .025 * perimeter, True)
-        if len(pts) != 4 or cv2.contourArea(pts) < .28 * small.shape[0] * small.shape[1]:
+        if (len(pts) != 4 or not cv2.isContourConvex(pts)
+                or cv2.contourArea(pts) < .38 * small.shape[0] * small.shape[1]):
             continue
         p = pts.reshape(4, 2).astype("float32") / scale
         sums, diffs = p.sum(axis=1), np.diff(p, axis=1).flatten()
@@ -394,7 +421,8 @@ def detect_page(im):
         tl, tr, br, bl = src
         destw = max(int(np.linalg.norm(tr-tl)), int(np.linalg.norm(br-bl)))
         desth = max(int(np.linalg.norm(bl-tl)), int(np.linalg.norm(br-tr)))
-        if destw < 250 or desth < 250 or destw * desth > 32_000_000:
+        if (destw < 250 or desth < 250 or destw * desth > 32_000_000
+                or not .52 <= destw / desth <= 1.9):
             continue
         dst = np.array([[0,0],[destw-1,0],[destw-1,desth-1],[0,desth-1]], dtype="float32")
         warped = cv2.warpPerspective(rgb, cv2.getPerspectiveTransform(src, dst), (destw, desth))
@@ -403,57 +431,71 @@ def detect_page(im):
 
 
 def image_pdf(data, mode="clear"):
-    """High-contrast, print-sized A4 PDF with optional color and B/W modes.
+    """Convert phone photo to print-quality A4 without early JPEG downsizing.
 
-    Avoid inventing characters: unreadable/blurred originals should be retaken.
+    clear: neutralize gray shadows, retain handwriting and thin ink details.
+    color: preserve stamp/ink colors and improve lighting conservatively.
+    bw: stronger monochrome for high-contrast printed originals.
+    Unreadable source cannot be restored by software.
     """
     if mode not in ("clear", "color", "bw"):
-        raise UserError("نمط تحسين غير صحيح")
+        raise UserError("نمط التحسين غير صحيح")
     if len(data) > MAX_IMAGE:
-        raise UserError("الصورة الواحدة أكبر من 12MB")
+        raise UserError("حجم الصورة يتجاوز 12 ميغابايت")
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
         im = ImageOps.exif_transpose(im).convert("RGB")
     except Exception:
-        raise UserError("تعذر فتح الصورة. استخدم JPG أو PNG")
-    if im.width < 550 or im.height < 550:
-        raise UserError("دقة الصورة ضعيفة جدًا؛ صوّر الورقة من جديد")
+        raise UserError("تعذر فتح الصورة؛ استخدم JPG أو PNG")
+    if min(im.size) < 650:
+        raise UserError("دقة الصورة ضعيفة. قرّب الهاتف وأعد التصوير.")
+    # Bound memory use on a small Render server, while retaining ~300dpi detail.
+    if max(im.size) > 3200:
+        im.thumbnail((3200, 3200), Image.Resampling.LANCZOS)
     im, cropped = detect_page(im)
     rgb = np.asarray(im.convert("RGB"))
     if mode == "color":
-        # Gently flatten lighting while preserving colored stamps and signatures.
         lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
         light, a, b = cv2.split(lab)
-        light = cv2.createCLAHE(clipLimit=1.7, tileGridSize=(8, 8)).apply(light)
+        light = cv2.createCLAHE(clipLimit=1.35, tileGridSize=(8, 8)).apply(light)
         rgb = cv2.cvtColor(cv2.merge((light, a, b)), cv2.COLOR_LAB2RGB)
-        processed = Image.fromarray(rgb).filter(ImageFilter.UnsharpMask(radius=1.0, percent=100, threshold=3))
+        processed = Image.fromarray(rgb).filter(
+            ImageFilter.UnsharpMask(radius=.8, percent=90, threshold=3))
     else:
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        # Normalize uneven lighting using a slowly varying estimate of paper
+        # background, without applying hard thresholds to handwriting.
+        h, w = gray.shape
+        smw, smh = max(48, round(w * min(1., 500/max(w,h)))), max(48, round(h * min(1., 500/max(w,h))))
+        background_small = cv2.resize(gray, (smw, smh), interpolation=cv2.INTER_AREA)
+        background_small = cv2.GaussianBlur(background_small, (0,0), sigmaX=15)
+        background = cv2.resize(background_small, (w,h), interpolation=cv2.INTER_LINEAR)
+        background = np.maximum(background, 80)
+        normalized = cv2.divide(gray, background, scale=246)
+        # Gentle dark-text enhancement with well-defined white background.
+        normalized = cv2.convertScaleAbs(normalized, alpha=1.10, beta=-12)
         if mode == "bw":
-            # Sharp black-on-white printing for clean typed documents.
-            gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, 35, 12)
-        processed = Image.fromarray(gray).filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=2)).convert("RGB")
-    # A4 at 200 dpi. Fit to nearly the whole sheet, including upscaling a small
-    # document: the old thumbnail() never upscaled, causing a tiny printout.
-    page_w, page_h = 1654, 2339
-    margin = 65
+            # Deliberately stronger, optional printing mode; not the default.
+            normalized = cv2.adaptiveThreshold(
+                normalized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 41, 14)
+        processed = Image.fromarray(normalized).filter(
+            ImageFilter.UnsharpMask(radius=.8, percent=115, threshold=2))
+    # A4 portrait at 300 dpi; preserve aspect ratio and 9mm margins.
+    page_w, page_h = 2480, 3508
+    margin = 105
     if processed.width > processed.height:
-        # Rotate landscape source for better use of A4 page when appropriate.
         processed = processed.rotate(90, expand=True)
     target_w, target_h = page_w - 2 * margin, page_h - 2 * margin
     factor = min(target_w / processed.width, target_h / processed.height)
-    new_size = (max(1, int(processed.width * factor)), max(1, int(processed.height * factor)))
-    # Upscaling cannot recover missing detail; bicubic avoids false edge halos.
+    new_size = (max(1, round(processed.width*factor)), max(1, round(processed.height*factor)))
     processed = processed.resize(new_size, Image.Resampling.LANCZOS if factor < 1 else Image.Resampling.BICUBIC)
-    page = Image.new("RGB", (page_w, page_h), "white")
-    page.paste(processed, ((page_w - new_size[0]) // 2, (page_h - new_size[1]) // 2))
+    page = Image.new("RGB" if mode == "color" else "L", (page_w, page_h), "white")
+    page.paste(processed, ((page_w-new_size[0])//2, (page_h-new_size[1])//2))
     output = io.BytesIO()
-    page.save(output, format="PDF", resolution=200, quality=83)
+    page.save(output, format="PDF", resolution=300, quality=95)
     return output.getvalue(), cropped
-
 
 def images_as_pdf(files, mode="clear"):
     if not files or len(files) > 20:
@@ -542,35 +584,31 @@ def upload_doc(teacher_id, kind):
     new_pdf, cropped = images_as_pdf(request.files.getlist("images"), request.form.get("quality", "clear"))
     mode = request.form.get("mode", "append")
     old = find_doc(teacher_id, kind)
-    # Scanners can ONLY create a missing document. Corrections, replacement,
-    # extra pages and deletion are reserved for the administrator.
-    if request.current_user["role"] == "scanner":
-        if old:
-            raise UserError("تم تصوير هذا المستند بالفعل. اطلب من المدير تعديله أو إضافة صفحات.", 409)
-        if mode != "replace":
-            raise UserError("المستخدم مصرح له بتصوير المستندات الناقصة فقط", 403)
-    expected_version = request.form.get("expected_version", "")
-    if expected_version:
-        try:
-            expected_version = int(expected_version)
-        except ValueError:
-            raise UserError("نسخة المستند غير صحيحة")
-        if (old["version"] if old else 0) != expected_version:
-            raise UserError("هذا المستند تغير من جهاز آخر. حدّث الصفحة قبل إعادة التصوير.", 409)
+    # Scanners may add/correct their OWN documents; edits to others remain admin-only.
+    if old:
+        require_document_editor(old)
+    if old:
+        check_document_version(old, request.form.get("expected_version"), required=True)
+    else:
+        raw_expected = request.form.get("expected_version", "0")
+        if raw_expected not in ("", "0"):
+            raise UserError("تم تصوير هذا المستند من جهاز آخر؛ حدّث القائمة.", 409)
     final = new_pdf
     if old and mode == "append":
         final = merge_pdfs(storage().download(old["storage_path"]), new_pdf, "append")
     elif mode not in ("append", "replace"):
         raise UserError("اختر إضافة صفحات أو استبدال المستند")
     saved = save_doc(teacher_id, kind, final, len(PdfReader(io.BytesIO(final)).pages), old)
-    audit("تصوير مستند", f"{teacher['full_name']} - {KINDS[kind]}")
+    audit("تعديل مستند" if old else "تصوير مستند", f"{teacher['full_name']} - {KINDS[kind]}")
     return jsonify(document=saved, auto_crop_count=cropped)
 
 
 @app.post("/api/documents/<doc_id>/pages/<int:page>/replace")
-@login_required(roles=("admin",))
+@login_required(roles=("admin", "scanner"))
 def replace_page(doc_id, page):
     doc = get_doc(doc_id)
+    require_document_editor(doc)
+    check_document_version(doc, request.form.get("expected_version"), required=True)
     imgs = request.files.getlist("images")
     if len(imgs) != 1:
         raise UserError("اختَر صورة واحدة للاستبدال")
@@ -582,9 +620,11 @@ def replace_page(doc_id, page):
 
 
 @app.delete("/api/documents/<doc_id>/pages/<int:page>")
-@login_required(roles=("admin",))
+@login_required(roles=("admin", "scanner"))
 def remove_page(doc_id, page):
     doc = get_doc(doc_id)
+    require_document_editor(doc)
+    check_document_version(doc, request.args.get("expected_version"), required=True)
     old = PdfReader(io.BytesIO(storage().download(doc["storage_path"])))
     if len(old.pages) < 2:
         raise UserError("هذه آخر صفحة؛ استخدم زر حذف المستند كاملًا")
@@ -602,10 +642,14 @@ def remove_page(doc_id, page):
 
 
 @app.delete("/api/documents/<doc_id>")
-@login_required(roles=("admin",))
+@login_required(roles=("admin", "scanner"))
 def remove_doc(doc_id):
     doc = get_doc(doc_id)
-    table("documents").delete().eq("id", doc["id"]).execute()
+    require_document_editor(doc)
+    check_document_version(doc, request.args.get("expected_version"), required=True)
+    deleted = table("documents").delete().eq("id", doc["id"]).eq("version",doc["version"]).execute()
+    if not deleted.data:
+        raise UserError("هذا المستند تغير من جهاز آخر. حدّث الصفحة أولًا.", 409)
     try:
         storage().remove([doc["storage_path"]])
     except Exception:
@@ -615,9 +659,11 @@ def remove_doc(doc_id):
 
 
 @app.get("/api/documents/<doc_id>/pdf")
-@login_required(roles=("admin", "viewer"))
+@login_required(roles=("admin", "viewer", "scanner"))
 def download_doc(doc_id):
     doc = get_doc(doc_id)
+    if request.current_user["role"] == "scanner":
+        require_document_editor(doc)
     teacher = teacher_by_id(doc["teacher_id"])
     data = storage().download(doc["storage_path"])
     name = f"{clean(teacher['full_name'])}-{clean(KINDS[doc['kind']])}.pdf"
