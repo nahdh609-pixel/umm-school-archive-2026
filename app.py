@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from datetime import datetime, timezone
 from functools import lru_cache, wraps
 from pathlib import Path
@@ -31,6 +32,7 @@ KINDS = {
 BUCKET = "teacher-archive-private"
 MAX_IMAGE = 12 * 1024 * 1024
 MAX_REQUEST = 75 * 1024 * 1024
+LOGIN_ATTEMPTS = {}  # basic in-process throttle (single Gunicorn worker)
 Image.MAX_IMAGE_PIXELS = 32_000_000
 app = Flask(__name__, static_folder=None)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or secrets.token_hex(32)
@@ -48,6 +50,16 @@ logging.basicConfig(level=logging.INFO)
 class UserError(Exception):
     def __init__(self, message, code=400):
         self.message, self.code = message, code
+
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.errorhandler(UserError)
@@ -172,6 +184,11 @@ def health():
 
 @app.post("/api/login")
 def login():
+    ip = request.remote_addr or "unknown"
+    now = time.monotonic()
+    recent = [t for t in LOGIN_ATTEMPTS.get(ip, []) if now - t < 900]
+    if len(recent) >= 12:
+        raise UserError("محاولات دخول كثيرة. أعد المحاولة بعد 15 دقيقة.", 429)
     boot_admin()
     data = request.get_json(silent=True) or {}
     name = str(data.get("username", "")).strip()
@@ -179,7 +196,9 @@ def login():
     users = table("users").select("*").eq("username", name).limit(1).execute().data or []
     user = users[0] if users else None
     if not user or not user["active"] or not check_password_hash(user["password_hash"], password):
+        LOGIN_ATTEMPTS[ip] = (recent + [now])[-12:]
         raise UserError("اسم المستخدم أو كلمة المرور غير صحيحة", 401)
+    LOGIN_ATTEMPTS.pop(ip, None)
     session.clear()
     session.permanent = True
     session["uid"] = user["id"]
@@ -205,11 +224,18 @@ def me():
 @app.get("/api/state")
 @login_required()
 def state():
-    teachers = all_records("teachers", "id,full_name,national_id,position,created_at")
-    docs = all_records("documents", "id,teacher_id,kind,pages,version,created_at,updated_at", "created_at")
-    logs = table("logs").select("actor_name,action,details,created_at").order("created_at", desc=True).limit(30).execute().data or []
+    role = request.current_user["role"]
+    # A photography-only user may choose from existing teachers and see which
+    # documents still need scanning; they cannot access national IDs, PDFs,
+    # exports, staff activity logs, or account management.
+    teacher_fields = "id,full_name,position" if role == "scanner" else "id,full_name,national_id,position,created_at"
+    document_fields = "teacher_id,kind" if role == "scanner" else "id,teacher_id,kind,pages,version,created_at,updated_at"
+    teachers = all_records("teachers", teacher_fields)
+    docs = all_records("documents", document_fields, "created_at")
+    logs = []
     users = []
-    if request.current_user["role"] == "admin":
+    if role == "admin":
+        logs = table("logs").select("actor_name,action,details,created_at").order("created_at", desc=True).limit(30).execute().data or []
         users = table("users").select("id,username,full_name,role,active,created_at").order("created_at").execute().data or []
     return jsonify(teachers=teachers, documents=docs, logs=logs, users=users)
 
@@ -231,7 +257,7 @@ def validated_teacher(data):
 
 
 @app.post("/api/teachers")
-@login_required(roles=("admin", "scanner"))
+@login_required(roles=("admin",))
 def add_teacher():
     values = validated_teacher(request.get_json(silent=True) or {})
     if table("teachers").select("id").eq("national_id", values["national_id"]).limit(1).execute().data:
@@ -283,7 +309,8 @@ def parse_spreadsheet(file):
     if not values:
         raise UserError("الملف فارغ")
     first = [str(v or "").lower().strip() for v in values[0]]
-    header = any(x in " ".join(first) for x in ("اسم", "name", "الوطني", "national"))
+    header = any("الوطني" in x or "national" in x for x in first) or (
+        bool(first) and first[0] in ("الاسم", "اسم المعلم", "name", "full_name"))
     def col(words, fallback):
         for i, val in enumerate(first):
             if any(w in val for w in words):
@@ -375,7 +402,13 @@ def detect_page(im):
     return im, False
 
 
-def image_pdf(data):
+def image_pdf(data, mode="clear"):
+    """High-contrast, print-sized A4 PDF with optional color and B/W modes.
+
+    Avoid inventing characters: unreadable/blurred originals should be retaken.
+    """
+    if mode not in ("clear", "color", "bw"):
+        raise UserError("نمط تحسين غير صحيح")
     if len(data) > MAX_IMAGE:
         raise UserError("الصورة الواحدة أكبر من 12MB")
     try:
@@ -387,31 +420,49 @@ def image_pdf(data):
     if im.width < 550 or im.height < 550:
         raise UserError("دقة الصورة ضعيفة جدًا؛ صوّر الورقة من جديد")
     im, cropped = detect_page(im)
-    # Portable, legible A4 pages at 200 dpi, with automatic exposure and sharpening.
-    gray = ImageOps.autocontrast(ImageOps.grayscale(im), cutoff=0.7)
-    gray = ImageEnhance.Contrast(gray).enhance(1.22)
-    gray = gray.filter(ImageFilter.UnsharpMask(radius=1.35, percent=135, threshold=3))
-    page = Image.new("RGB", (1654, 2339), "white")
-    gray.thumbnail((1520, 2200), Image.Resampling.LANCZOS)
-    if gray.width > gray.height:
-        # Preserve landscape pages by fitting them within A4, without cropping text.
-        pass
-    x = (1654 - gray.width) // 2
-    y = (2339 - gray.height) // 2
-    page.paste(gray.convert("RGB"), (x, y))
+    rgb = np.asarray(im.convert("RGB"))
+    if mode == "color":
+        # Gently flatten lighting while preserving colored stamps and signatures.
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        light, a, b = cv2.split(lab)
+        light = cv2.createCLAHE(clipLimit=1.7, tileGridSize=(8, 8)).apply(light)
+        rgb = cv2.cvtColor(cv2.merge((light, a, b)), cv2.COLOR_LAB2RGB)
+        processed = Image.fromarray(rgb).filter(ImageFilter.UnsharpMask(radius=1.0, percent=100, threshold=3))
+    else:
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        if mode == "bw":
+            # Sharp black-on-white printing for clean typed documents.
+            gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY, 35, 12)
+        processed = Image.fromarray(gray).filter(ImageFilter.UnsharpMask(radius=1.2, percent=115, threshold=2)).convert("RGB")
+    # A4 at 200 dpi. Fit to nearly the whole sheet, including upscaling a small
+    # document: the old thumbnail() never upscaled, causing a tiny printout.
+    page_w, page_h = 1654, 2339
+    margin = 65
+    if processed.width > processed.height:
+        # Rotate landscape source for better use of A4 page when appropriate.
+        processed = processed.rotate(90, expand=True)
+    target_w, target_h = page_w - 2 * margin, page_h - 2 * margin
+    factor = min(target_w / processed.width, target_h / processed.height)
+    new_size = (max(1, int(processed.width * factor)), max(1, int(processed.height * factor)))
+    # Upscaling cannot recover missing detail; bicubic avoids false edge halos.
+    processed = processed.resize(new_size, Image.Resampling.LANCZOS if factor < 1 else Image.Resampling.BICUBIC)
+    page = Image.new("RGB", (page_w, page_h), "white")
+    page.paste(processed, ((page_w - new_size[0]) // 2, (page_h - new_size[1]) // 2))
     output = io.BytesIO()
-    page.save(output, format="PDF", resolution=200, quality=86)
+    page.save(output, format="PDF", resolution=200, quality=83)
     return output.getvalue(), cropped
 
 
-def images_as_pdf(files):
+def images_as_pdf(files, mode="clear"):
     if not files or len(files) > 20:
         raise UserError("اختَر من 1 إلى 20 صورة في كل مرة")
     writer, auto_crop_count = PdfWriter(), 0
     for f in files:
         if not (f.mimetype or "").startswith("image/"):
             raise UserError("يُسمح برفع الصور فقط")
-        pdf, auto = image_pdf(f.read(MAX_IMAGE + 1))
+        pdf, auto = image_pdf(f.read(MAX_IMAGE + 1), mode=mode)
         auto_crop_count += int(auto)
         writer.append(io.BytesIO(pdf))
     out = io.BytesIO()
@@ -458,7 +509,21 @@ def save_doc(teacher_id, kind, contents, pages, old=None):
                 "version": 1, "storage_path": path, "uploaded_by": session.get("uid"),
             }).execute()
     except Exception:
-        storage().remove([path])
+        try:
+            storage().remove([path])
+        except Exception:
+            app.logger.exception("Failed to remove unsaved PDF")
+        # Two authorized devices may scan the same missing document at once.
+        # Preserve the first save and ask the second device to refresh, instead
+        # of presenting a generic internal error or replacing another scan.
+        if old is None:
+            try:
+                if find_doc(teacher_id, kind):
+                    raise UserError("هذا المستند حُفظ من جهاز آخر. حدّث الصفحة لمشاهدة الحالة.", 409)
+            except UserError:
+                raise
+            except Exception:
+                app.logger.warning("Could not verify simultaneous upload", exc_info=True)
         raise
     if old:
         try:
@@ -474,9 +539,24 @@ def upload_doc(teacher_id, kind):
     teacher = teacher_by_id(teacher_id)
     if kind not in KINDS:
         raise UserError("نوع المستند غير معروف")
-    new_pdf, cropped = images_as_pdf(request.files.getlist("images"))
+    new_pdf, cropped = images_as_pdf(request.files.getlist("images"), request.form.get("quality", "clear"))
     mode = request.form.get("mode", "append")
     old = find_doc(teacher_id, kind)
+    # Scanners can ONLY create a missing document. Corrections, replacement,
+    # extra pages and deletion are reserved for the administrator.
+    if request.current_user["role"] == "scanner":
+        if old:
+            raise UserError("تم تصوير هذا المستند بالفعل. اطلب من المدير تعديله أو إضافة صفحات.", 409)
+        if mode != "replace":
+            raise UserError("المستخدم مصرح له بتصوير المستندات الناقصة فقط", 403)
+    expected_version = request.form.get("expected_version", "")
+    if expected_version:
+        try:
+            expected_version = int(expected_version)
+        except ValueError:
+            raise UserError("نسخة المستند غير صحيحة")
+        if (old["version"] if old else 0) != expected_version:
+            raise UserError("هذا المستند تغير من جهاز آخر. حدّث الصفحة قبل إعادة التصوير.", 409)
     final = new_pdf
     if old and mode == "append":
         final = merge_pdfs(storage().download(old["storage_path"]), new_pdf, "append")
@@ -488,13 +568,13 @@ def upload_doc(teacher_id, kind):
 
 
 @app.post("/api/documents/<doc_id>/pages/<int:page>/replace")
-@login_required(roles=("admin", "scanner"))
+@login_required(roles=("admin",))
 def replace_page(doc_id, page):
     doc = get_doc(doc_id)
     imgs = request.files.getlist("images")
     if len(imgs) != 1:
         raise UserError("اختَر صورة واحدة للاستبدال")
-    pdf, cropped = images_as_pdf(imgs)
+    pdf, cropped = images_as_pdf(imgs, request.form.get("quality", "clear"))
     updated = merge_pdfs(storage().download(doc["storage_path"]), pdf, "replace_page", page)
     saved = save_doc(doc["teacher_id"], doc["kind"], updated, doc["pages"], doc)
     audit("استبدال صفحة", f"{doc['kind']} - صفحة {page+1}")
@@ -535,7 +615,7 @@ def remove_doc(doc_id):
 
 
 @app.get("/api/documents/<doc_id>/pdf")
-@login_required()
+@login_required(roles=("admin", "viewer"))
 def download_doc(doc_id):
     doc = get_doc(doc_id)
     teacher = teacher_by_id(doc["teacher_id"])
@@ -545,7 +625,7 @@ def download_doc(doc_id):
 
 
 @app.get("/api/teachers/<teacher_id>/combined.pdf")
-@login_required()
+@login_required(roles=("admin", "viewer"))
 def combined_pdf(teacher_id):
     teacher = teacher_by_id(teacher_id)
     docs = table("documents").select("*").eq("teacher_id", uid(teacher_id)).execute().data or []
@@ -563,37 +643,81 @@ def combined_pdf(teacher_id):
                      download_name=f"{clean(teacher['full_name'])}-الملف_الكامل.pdf")
 
 
-def archive_stream(teachers):
+def archive_stream(teachers, output_format="folders"):
+    """Stream ordered teacher folders or individual combined PDFs in a ZIP."""
+    if output_format not in ("folders", "pdf"):
+        raise UserError("صيغة التصدير غير صحيحة")
     zs = ZipStream(compress_type=ZIP_STORED)
+    doc_rows = all_records("documents", "teacher_id,kind,storage_path")
+    grouped = {}
+    for row in doc_rows:
+        grouped.setdefault(row["teacher_id"], {})[row["kind"]] = row
     for teacher in teachers:
-        folder = f"{clean(teacher['full_name'])}_{clean(teacher['national_id'][-4:])}"
-        docs = table("documents").select("kind,storage_path").eq("teacher_id", teacher["id"]).execute().data or []
-        for doc in docs:
-            entry = f"{folder}/{clean(KINDS[doc['kind']])}.pdf"
-            path = doc["storage_path"]
-            def load_chunks(path=path):
-                contents = storage().download(path)
+        by_kind = grouped.get(teacher["id"], {})
+        if not by_kind:
+            continue
+        label = f"{clean(teacher['full_name'])}_{clean(teacher['national_id'][-4:])}_{teacher['id'][:6]}"
+        if output_format == "pdf":
+            def build_combined(by_kind=by_kind):
+                writer = PdfWriter()
+                for kind in KINDS:
+                    if kind in by_kind:
+                        writer.append(io.BytesIO(storage().download(by_kind[kind]["storage_path"])))
+                output = io.BytesIO()
+                writer.write(output)
+                contents = output.getvalue()
                 for ix in range(0, len(contents), 65536):
                     yield contents[ix:ix+65536]
-            zs.add(load_chunks(), entry)
+            zs.add(build_combined(), f"{label}.pdf")
+        else:
+            for kind in KINDS:
+                doc = by_kind.get(kind)
+                if not doc:
+                    continue
+                entry = f"{label}/{clean(KINDS[kind])}.pdf"
+                path = doc["storage_path"]
+                def load_chunks(path=path):
+                    contents = storage().download(path)
+                    for ix in range(0, len(contents), 65536):
+                        yield contents[ix:ix+65536]
+                zs.add(load_chunks(), entry)
     return zs
 
 
 @app.get("/api/teachers/<teacher_id>/archive.zip")
-@login_required()
+@login_required(roles=("admin", "viewer"))
 def export_teacher(teacher_id):
     teacher = teacher_by_id(teacher_id)
-    return Response(stream_with_context(archive_stream([teacher])), mimetype="application/zip",
-                    headers={"Content-Disposition": "attachment; filename*=UTF-8''teacher_archive.zip", "Cache-Control": "no-store"})
+    output_format = request.args.get("format", "folders")
+    if output_format not in ("folders", "pdf"):
+        raise UserError("صيغة تصدير غير صحيحة")
+    return Response(stream_with_context(archive_stream([teacher], output_format)), mimetype="application/zip",
+                    headers={"Content-Disposition": "attachment; filename=teacher_archive.zip", "Cache-Control": "no-store"})
 
 
 @app.get("/api/export.zip")
 @login_required(roles=("admin",))
 def export_all():
-    start = max(0, int(request.args.get("start", 0)))
-    count = max(1, min(400, int(request.args.get("count", 50))))
-    teachers = all_records("teachers", "id,full_name,national_id,position,created_at")[start:start+count]
-    return Response(stream_with_context(archive_stream(teachers)), mimetype="application/zip",
+    try:
+        start = max(0, int(request.args.get("start", 0)))
+        count = max(1, min(400, int(request.args.get("count", 50))))
+    except ValueError:
+        raise UserError("عدد المعلمين غير صحيح")
+    filter_status = request.args.get("status", "all")
+    output_format = request.args.get("format", "folders")
+    if filter_status not in ("all", "complete", "incomplete") or output_format not in ("folders", "pdf"):
+        raise UserError("فلتر التصدير أو صيغته غير صحيحين")
+    teachers = all_records("teachers", "id,full_name,national_id,position,created_at")
+    doc_rows = all_records("documents", "teacher_id,kind")
+    counts = {}
+    for doc in doc_rows:
+        counts.setdefault(doc["teacher_id"], set()).add(doc["kind"])
+    if filter_status == "complete":
+        teachers = [t for t in teachers if len(counts.get(t["id"], ())) == len(KINDS)]
+    elif filter_status == "incomplete":
+        teachers = [t for t in teachers if len(counts.get(t["id"], ())) < len(KINDS)]
+    teachers = sorted(teachers, key=lambda t: t["full_name"])[start:start+count]
+    return Response(stream_with_context(archive_stream(teachers, output_format)), mimetype="application/zip",
                     headers={"Content-Disposition": "attachment; filename=school_archive.zip", "Cache-Control": "no-store"})
 
 
