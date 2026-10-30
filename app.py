@@ -156,6 +156,24 @@ def audit(action, info=""):
         app.logger.warning("Audit write failed", exc_info=True)
 
 
+def audit_document(action, doc, extra=""):
+    """Include teacher name AND national ID in audit trail; no schema changes."""
+    teacher = teacher_by_id(doc["teacher_id"])
+    details = (
+        f"معلم: {teacher['full_name']} | وطني: {teacher['national_id']} | "
+        f"مستند: {KINDS.get(doc['kind'], doc['kind'])} | "
+        f"ID:{teacher['id']}"
+    )
+    if extra:
+        details += f" | {extra}"
+    audit(action, details)
+
+
+def audit_new_document(action, teacher, kind):
+    audit(action, f"معلم: {teacher['full_name']} | وطني: {teacher['national_id']} | "
+                  f"مستند: {KINDS[kind]} | ID:{teacher['id']}")
+
+
 def boot_admin():
     existing = table("users").select("id").limit(1).execute().data
     if existing:
@@ -528,8 +546,8 @@ def pdf_from_image(image, mode="scan", automatic_crop=True, manual_points=None):
             ImageFilter.UnsharpMask(radius=.55, percent=75, threshold=3))
     # 230 dpi A4 gives clear text with faster conversion, smaller uploads and
     # smaller PDFs than re-encoding every sheet at 300 dpi and quality 96.
-    sheet_w, sheet_h = 1901, 2688
-    margin = 38
+    sheet_w, sheet_h = 1748, 2479  # A4 ~210 DPI, lighter to render and transfer
+    margin = 28
     if processed.width > processed.height:
         processed = processed.rotate(90, expand=True)
     avail_w, avail_h = sheet_w - 2*margin, sheet_h - 2*margin
@@ -539,7 +557,7 @@ def pdf_from_image(image, mode="scan", automatic_crop=True, manual_points=None):
     sheet = Image.new("RGB" if mode == "color" else "L", (sheet_w, sheet_h), "white")
     sheet.paste(processed, ((sheet_w-new_size[0])//2, (sheet_h-new_size[1])//2))
     out = io.BytesIO()
-    sheet.save(out, format="PDF", resolution=230, quality=87)
+    sheet.save(out, format="PDF", resolution=210, quality=82)
     return out.getvalue(), cropped
 
 
@@ -662,8 +680,10 @@ def upload_doc(teacher_id, kind):
         final = merge_pdfs(storage().download(old["storage_path"]), new_pdf, "append")
     elif mode not in ("append", "replace"):
         raise UserError("اختر إضافة صفحات أو استبدال المستند")
-    saved = save_doc(teacher_id, kind, final, len(PdfReader(io.BytesIO(final)).pages), old)
-    audit("تعديل مستند" if old else "تصوير مستند", f"{teacher['full_name']} - {KINDS[kind]}")
+    saved = save_doc(teacher_id, kind, final,
+                     (old["pages"] if old and mode == "append" else 0) +
+                     len(request.files.getlist("images")), old)
+    audit_new_document("تعديل مستند" if old else "تصوير مستند", teacher, kind)
     return jsonify(document=saved, auto_crop_count=cropped)
 
 
@@ -679,7 +699,7 @@ def replace_page(doc_id, page):
     pdf, cropped = images_as_pdf(imgs, request.form.get("quality", "scan"), request.form.get("crop_points"))
     updated = merge_pdfs(storage().download(doc["storage_path"]), pdf, "replace_page", page)
     saved = save_doc(doc["teacher_id"], doc["kind"], updated, doc["pages"], doc)
-    audit("استبدال صفحة", f"{doc['kind']} - صفحة {page+1}")
+    audit_document("استبدال صفحة", doc, f"صفحة {page+1}")
     return jsonify(document=saved, auto_crop_count=cropped)
 
 
@@ -701,7 +721,7 @@ def remove_page(doc_id, page):
     out = io.BytesIO()
     writer.write(out)
     saved = save_doc(doc["teacher_id"], doc["kind"], out.getvalue(), len(old.pages)-1, doc)
-    audit("حذف صفحة", f"{doc['kind']} - صفحة {page+1}")
+    audit_document("حذف صفحة", doc, f"صفحة {page+1}")
     return jsonify(document=saved)
 
 
@@ -718,7 +738,7 @@ def remove_doc(doc_id):
         storage().remove([doc["storage_path"]])
     except Exception:
         app.logger.exception("File cleanup after deletion failed")
-    audit("حذف مستند", doc["kind"])
+    audit_document("حذف مستند", doc)
     return jsonify(ok=True)
 
 
@@ -745,7 +765,7 @@ def enhance_existing_pdf(doc_id):
     result = io.BytesIO()
     writer.write(result)
     saved = save_doc(doc["teacher_id"], doc["kind"], result.getvalue(), len(pdf.pages), doc)
-    audit("تحسين وضوح PDF", f"{doc['kind']} - {len(pdf.pages)} صفحة")
+    audit_document("تحسين وضوح PDF", doc, f"{len(pdf.pages)} صفحة")
     return jsonify(document=saved)
 
 
