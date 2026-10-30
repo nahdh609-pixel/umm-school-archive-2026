@@ -174,7 +174,11 @@ def boot_admin():
 
 @app.get("/")
 def home():
-    return send_from_directory(ROOT, "index.html")
+    response = send_from_directory(ROOT, "index.html")
+    # Android browsers may otherwise keep showing the older interface after
+    # GitHub + Render deployment. The archive data itself is unaffected.
+    response.headers["Cache-Control"] = "no-store, max-age=0, must-revalidate"
+    return response
 
 
 @app.get("/health")
@@ -375,17 +379,16 @@ def get_doc(id_):
 
 
 def require_document_editor(doc):
-    """Scanner may correct/delete only docs last saved by their own account.
+    """Staff photographers may correct any saved teacher document.
 
-    This also allows different phones logged in to the same account to correct
-    that account's scans. Other users' documents remain admin-only.
+    Removing an image/PDF or replacing it always requires a current version;
+    concurrent edits fail safely rather than silently overwriting one another.
+    All actions are logged. Teacher deletion/export and account management
+    remain admin-only.
     """
-    actor = request.current_user
-    if actor["role"] == "admin":
+    if request.current_user["role"] in ("admin", "scanner"):
         return
-    if actor["role"] == "scanner" and doc.get("uploaded_by") == actor["id"]:
-        return
-    raise UserError("لا يمكنك تعديل مستند صوّره مستخدم آخر؛ تواصل مع المدير.", 403)
+    raise UserError("ليس لديك صلاحية تعديل مستندات PDF", 403)
 
 
 def check_document_version(doc, raw, required=False):
@@ -430,74 +433,84 @@ def detect_page(im):
     return im, False
 
 
-def image_pdf(data, mode="clear"):
-    """Convert phone photo to print-quality A4 without early JPEG downsizing.
+def pdf_from_image(image, mode="scan", automatic_crop=True):
+    """Create a printable A4 PDF from a real image, preserving page details.
 
-    clear: neutralize gray shadows, retain handwriting and thin ink details.
-    color: preserve stamp/ink colors and improve lighting conservatively.
-    bw: stronger monochrome for high-contrast printed originals.
-    Unreadable source cannot be restored by software.
+    scan: brighter paper and darker lettering (recommended for school files).
+    clear: gentle gray normalization for delicate handwriting.
+    color: preserves stamps and pen colors.
+    bw: high-contrast black/white; may lose faint handwriting.
+    Camera blur cannot be restored by artificial upscaling.
     """
-    if mode not in ("clear", "color", "bw"):
+    if mode not in ("scan", "clear", "color", "bw"):
         raise UserError("نمط التحسين غير صحيح")
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    if min(image.size) < 650:
+        raise UserError("دقة الصورة ضعيفة. قرّب الهاتف وأعد التصوير.")
+    if max(image.size) > 3400:
+        image.thumbnail((3400, 3400), Image.Resampling.LANCZOS)
+    cropped = False
+    if automatic_crop:
+        image, cropped = detect_page(image)
+    rgb = np.asarray(image.convert("RGB"))
+    if mode == "color":
+        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        light, ca, cb = cv2.split(lab)
+        light = cv2.createCLAHE(clipLimit=1.25, tileGridSize=(8, 8)).apply(light)
+        balanced = cv2.cvtColor(cv2.merge((light, ca, cb)), cv2.COLOR_LAB2RGB)
+        processed = Image.fromarray(balanced).filter(ImageFilter.UnsharpMask(radius=.8, percent=85, threshold=3))
+    else:
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        hh, ww = gray.shape
+        ratio = min(1.0, 460.0 / max(hh, ww))
+        bg_small = cv2.resize(gray, (max(40, round(ww * ratio)), max(40, round(hh * ratio))), interpolation=cv2.INTER_AREA)
+        bg_small = cv2.GaussianBlur(bg_small, (0, 0), sigmaX=16)
+        bg = cv2.resize(bg_small, (ww, hh), interpolation=cv2.INTER_LINEAR)
+        bg = np.maximum(bg, 65)
+        neutral = cv2.divide(gray, bg, scale=250)
+        if mode == "bw":
+            # For documents without delicate handwriting or light ink stamps.
+            neutral = cv2.adaptiveThreshold(neutral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                             cv2.THRESH_BINARY, 41, 13)
+        else:
+            ink = 255.0 - neutral.astype(np.float32)
+            strength = 1.50 if mode == "scan" else 1.16
+            result = np.clip(255.0 - ink * strength, 0.0, 255.0)
+            if mode == "scan":
+                # A soft highlight lift whitens the sheet while preserving faint writing.
+                highlight = np.clip((result - 237.0) / 18.0, 0.0, 1.0)
+                result += (255.0 - result) * highlight * 0.82
+            neutral = np.clip(result, 0, 255).astype(np.uint8)
+        processed = Image.fromarray(neutral).filter(
+            ImageFilter.UnsharpMask(radius=.65, percent=95 if mode == "scan" else 80, threshold=2))
+    # A4 portrait, 300 DPI canvas, never promise 300 DPI *optical* detail.
+    sheet_w, sheet_h = 2480, 3508
+    margin = 82
+    if processed.width > processed.height:
+        processed = processed.rotate(90, expand=True)
+    avail_w, avail_h = sheet_w - 2 * margin, sheet_h - 2 * margin
+    factor = min(avail_w / processed.width, avail_h / processed.height)
+    new_size = (max(1, round(processed.width * factor)), max(1, round(processed.height * factor)))
+    processed = processed.resize(new_size, Image.Resampling.LANCZOS if factor < 1 else Image.Resampling.BICUBIC)
+    sheet = Image.new("RGB" if mode == "color" else "L", (sheet_w, sheet_h), "white")
+    sheet.paste(processed, ((sheet_w-new_size[0])//2, (sheet_h-new_size[1])//2))
+    out = io.BytesIO()
+    sheet.save(out, format="PDF", resolution=300, quality=96)
+    return out.getvalue(), cropped
+
+
+def image_pdf(data, mode="scan"):
     if len(data) > MAX_IMAGE:
         raise UserError("حجم الصورة يتجاوز 12 ميغابايت")
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
-        im = ImageOps.exif_transpose(im).convert("RGB")
-    except Exception:
+        return pdf_from_image(im, mode)
+    except (ValueError, OSError, Image.DecompressionBombError):
         raise UserError("تعذر فتح الصورة؛ استخدم JPG أو PNG")
-    if min(im.size) < 650:
-        raise UserError("دقة الصورة ضعيفة. قرّب الهاتف وأعد التصوير.")
-    # Bound memory use on a small Render server, while retaining ~300dpi detail.
-    if max(im.size) > 3200:
-        im.thumbnail((3200, 3200), Image.Resampling.LANCZOS)
-    im, cropped = detect_page(im)
-    rgb = np.asarray(im.convert("RGB"))
-    if mode == "color":
-        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-        light, a, b = cv2.split(lab)
-        light = cv2.createCLAHE(clipLimit=1.35, tileGridSize=(8, 8)).apply(light)
-        rgb = cv2.cvtColor(cv2.merge((light, a, b)), cv2.COLOR_LAB2RGB)
-        processed = Image.fromarray(rgb).filter(
-            ImageFilter.UnsharpMask(radius=.8, percent=90, threshold=3))
-    else:
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        # Normalize uneven lighting using a slowly varying estimate of paper
-        # background, without applying hard thresholds to handwriting.
-        h, w = gray.shape
-        smw, smh = max(48, round(w * min(1., 500/max(w,h)))), max(48, round(h * min(1., 500/max(w,h))))
-        background_small = cv2.resize(gray, (smw, smh), interpolation=cv2.INTER_AREA)
-        background_small = cv2.GaussianBlur(background_small, (0,0), sigmaX=15)
-        background = cv2.resize(background_small, (w,h), interpolation=cv2.INTER_LINEAR)
-        background = np.maximum(background, 80)
-        normalized = cv2.divide(gray, background, scale=246)
-        # Gentle dark-text enhancement with well-defined white background.
-        normalized = cv2.convertScaleAbs(normalized, alpha=1.10, beta=-12)
-        if mode == "bw":
-            # Deliberately stronger, optional printing mode; not the default.
-            normalized = cv2.adaptiveThreshold(
-                normalized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY, 41, 14)
-        processed = Image.fromarray(normalized).filter(
-            ImageFilter.UnsharpMask(radius=.8, percent=115, threshold=2))
-    # A4 portrait at 300 dpi; preserve aspect ratio and 9mm margins.
-    page_w, page_h = 2480, 3508
-    margin = 105
-    if processed.width > processed.height:
-        processed = processed.rotate(90, expand=True)
-    target_w, target_h = page_w - 2 * margin, page_h - 2 * margin
-    factor = min(target_w / processed.width, target_h / processed.height)
-    new_size = (max(1, round(processed.width*factor)), max(1, round(processed.height*factor)))
-    processed = processed.resize(new_size, Image.Resampling.LANCZOS if factor < 1 else Image.Resampling.BICUBIC)
-    page = Image.new("RGB" if mode == "color" else "L", (page_w, page_h), "white")
-    page.paste(processed, ((page_w-new_size[0])//2, (page_h-new_size[1])//2))
-    output = io.BytesIO()
-    page.save(output, format="PDF", resolution=300, quality=95)
-    return output.getvalue(), cropped
 
-def images_as_pdf(files, mode="clear"):
+
+def images_as_pdf(files, mode="scan"):
     if not files or len(files) > 20:
         raise UserError("اختَر من 1 إلى 20 صورة في كل مرة")
     writer, auto_crop_count = PdfWriter(), 0
@@ -581,10 +594,10 @@ def upload_doc(teacher_id, kind):
     teacher = teacher_by_id(teacher_id)
     if kind not in KINDS:
         raise UserError("نوع المستند غير معروف")
-    new_pdf, cropped = images_as_pdf(request.files.getlist("images"), request.form.get("quality", "clear"))
+    new_pdf, cropped = images_as_pdf(request.files.getlist("images"), request.form.get("quality", "scan"))
     mode = request.form.get("mode", "append")
     old = find_doc(teacher_id, kind)
-    # Scanners may add/correct their OWN documents; edits to others remain admin-only.
+    # Photographers can fix any teacher document; admin controls management/exports.
     if old:
         require_document_editor(old)
     if old:
@@ -612,7 +625,7 @@ def replace_page(doc_id, page):
     imgs = request.files.getlist("images")
     if len(imgs) != 1:
         raise UserError("اختَر صورة واحدة للاستبدال")
-    pdf, cropped = images_as_pdf(imgs, request.form.get("quality", "clear"))
+    pdf, cropped = images_as_pdf(imgs, request.form.get("quality", "scan"))
     updated = merge_pdfs(storage().download(doc["storage_path"]), pdf, "replace_page", page)
     saved = save_doc(doc["teacher_id"], doc["kind"], updated, doc["pages"], doc)
     audit("استبدال صفحة", f"{doc['kind']} - صفحة {page+1}")
@@ -656,6 +669,33 @@ def remove_doc(doc_id):
         app.logger.exception("File cleanup after deletion failed")
     audit("حذف مستند", doc["kind"])
     return jsonify(ok=True)
+
+
+@app.post("/api/documents/<doc_id>/enhance")
+@login_required(roles=("admin", "scanner"))
+def enhance_existing_pdf(doc_id):
+    """Explicitly improve older archived raster PDFs. Never run on existing files silently."""
+    doc = get_doc(doc_id)
+    require_document_editor(doc)
+    check_document_version(doc, (request.get_json(silent=True) or {}).get("expected_version"), required=True)
+    # Existing archived documents in this application are one raster image per PDF page.
+    old_pdf = storage().download(doc["storage_path"])
+    pdf = PdfReader(io.BytesIO(old_pdf))
+    if not 1 <= len(pdf.pages) <= 20:
+        raise UserError("ملفات PDF الكبيرة تحتاج إعادة تصوير على دفعات")
+    writer = PdfWriter()
+    for page in pdf.pages:
+        images = page.images
+        if len(images) != 1:
+            raise UserError("هذا الملف ليس صورة ممسوحة واحدة لكل صفحة؛ استخدم إعادة التصوير بدل التحسين الآلي")
+        # Avoid camera-edge auto-crop for an already A4-formatted page.
+        improved, _ = pdf_from_image(images[0].image, mode="scan", automatic_crop=False)
+        writer.append(io.BytesIO(improved))
+    result = io.BytesIO()
+    writer.write(result)
+    saved = save_doc(doc["teacher_id"], doc["kind"], result.getvalue(), len(pdf.pages), doc)
+    audit("تحسين وضوح PDF", f"{doc['kind']} - {len(pdf.pages)} صفحة")
+    return jsonify(document=saved)
 
 
 @app.get("/api/documents/<doc_id>/pdf")
