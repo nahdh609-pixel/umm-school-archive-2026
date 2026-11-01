@@ -110,6 +110,7 @@
 <input id="camera" type="file" accept="image/*" capture="environment" class="hidden" onchange="picked(event)">
 <input id="gallery" type="file" accept="image/*" multiple class="hidden" onchange="picked(event)">
 <input id="excel" type="file" accept=".xlsx,.csv" class="hidden" onchange="importExcel(event)">
+<input id="restorePdfFile" type="file" accept="application/pdf,.pdf" class="hidden" onchange="restorePdfChosen(event)">
 <script>
 let notificationItems=[],unreadNotifications=0,lastReadAt='',firstNotificationPoll=true,notificationsTimer=null,previouslyDownloaded=new Set(),exportPreview=null,preparedBatch=null,preparedExpectedCount=0,downloadValidated=false;
 let user=null,csrf='',teachers=[],docs=[],logs=[],users=[],activeTab='home',pickedTeacher=null,pending=[],targetKind='',targetMode='append',targetPage=null,busy=false,searchText='',teacherFilter='all',expectedDocVersion=0,missingSearch='',missingLimit=35,startedMissingSearch='',startedMissingLimit=35;
@@ -118,7 +119,22 @@ const kinds={start:'مباشرة العمل',appointment:'قرار التعيي�
 const el=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function notify(msg,err=false){let n=el('toast');n.textContent=msg;n.style.background=err?'#922538':'#0b243b';n.classList.remove('hidden');clearTimeout(window.toastTimer);window.toastTimer=setTimeout(()=>n.classList.add('hidden'),5000)}
-async function api(url,opt={}){let headers=opt.headers||{};if(!(opt.body instanceof FormData)&&opt.body)headers['Content-Type']='application/json';if(opt.method&&opt.method!=='GET')headers['X-CSRF-Token']=csrf;let response=await fetch(url,{credentials:'same-origin',...opt,headers});let data=await response.json().catch(()=>({}));if(!response.ok){if(response.status===401){user=null;showLogin()}const err=Error(data.error||`فشل الطلب (${response.status})`);err.status=response.status;throw err}return data}
+async function api(url,opt={}){
+ const headers={...(opt.headers||{})};
+ if(!(opt.body instanceof FormData)&&opt.body)headers['Content-Type']='application/json';
+ if(opt.method&&opt.method!=='GET')headers['X-CSRF-Token']=csrf;
+ const safeRead=!opt.method||opt.method==='GET';
+ for(let i=0;i<(safeRead?3:1);i++){
+  try{
+   const response=await fetch(url,{credentials:'same-origin',...opt,headers,cache:safeRead?'no-store':'default'});
+   const data=await response.json().catch(()=>({}));
+   if(response.ok)return data;
+   if(response.status===401){user=null;showLogin()}
+   if(safeRead&&[502,503,504].includes(response.status)&&i<2){await new Promise(r=>setTimeout(r,500*(i+1)));continue}
+   const err=Error(data.error||`فشل الطلب (${response.status})`);err.status=response.status;throw err;
+  }catch(err){if(safeRead&&i<2&&(err instanceof TypeError)){await new Promise(r=>setTimeout(r,500*(i+1)));continue}throw err}
+ }
+}
 async function boot(){try{let x=await api('/api/me');user=x.user;csrf=x.csrf;showMain();await refresh()}catch(e){showLogin()}}
 function showLogin(){stopNotificationPolling();el('loginScreen').classList.remove('hidden');el('mainScreen').classList.add('hidden')}
 function showMain(){
@@ -360,6 +376,7 @@ if(scanner || admin){
           `<button class="btn sm secondary" onclick="photo('${kind}','replace',null,'camera')">إعادة تصوير</button>`+
           `<button class="btn sm secondary" onclick="replacePage('${d.id}')">استبدال صفحة</button>`+
           `<button class="btn sm secondary" onclick="enhanceOld('${d.id}')">✨ تحسين PDF الحالي</button>`+
+          (admin?`<button class="btn sm outline" onclick="restorePdfFromPhone('${d.id}')">📁 استعادة PDF من الهاتف</button>`:'')+
           `<button class="btn sm danger" onclick="deletePage('${d.id}')">حذف صفحة</button>`+
           `<button class="btn sm danger" onclick="deleteDoc('${d.id}')">حذف PDF</button>`;
       }else{
@@ -589,8 +606,57 @@ async function enhanceOld(id){
 function replacePage(id){let doc=docs.find(d=>d.id===id);if(!doc)return;let p=prompt(`رقم الصفحة التي تريد استبدالها (من 1 إلى ${doc.pages}):`);if(p===null)return;let i=Number(p)-1;if(!Number.isInteger(i)||i<0||i>=doc.pages){notify('رقم الصفحة غير صحيح',true);return}photo(doc.kind,'replace',{id,index:i},'camera')}
 async function deletePage(id){let d=docs.find(d=>d.id===id);let p=prompt(`أدخل رقم الصفحة المراد حذفها (1 إلى ${d.pages}):`);if(p===null)return;let i=Number(p)-1;if(!Number.isInteger(i)||i<0||i>=d.pages)return notify('رقم غير صحيح',true);if(!confirm('هل تؤكد حذف هذه الصفحة نهائيًا؟'))return;try{await api(`/api/documents/${id}/pages/${i}?expected_version=${d.version}`,{method:'DELETE'});await refresh();notify('تم حذف الصفحة')}catch(e){notify(e.message,true)}}
 async function deleteDoc(id){if(!confirm('هل تريد حذف ملف PDF كاملًا؟ لا يمكن التراجع.'))return;try{await api(`/api/documents/${id}?expected_version=${docs.find(d=>d.id===id)?.version||0}`,{method:'DELETE'});await refresh();notify('تم حذف PDF')}catch(e){notify(e.message,true)}}
-function openPdf(id){window.open(`/api/documents/${id}/pdf`,'_blank','noopener')}
-function getFile(url){window.location.href=url}
+let restorePdfDocId=null;
+function restorePdfFromPhone(id){
+ const d=docs.find(x=>x.id===id);
+ if(!d||user?.role!=='admin')return;
+ if(!confirm('اختَر نسخة PDF محفوظة مسبقًا لنفس المعلم ونفس نوع المستند. ستحل محل المرجع الحالي بعد التحقق منها، مع الاحتفاظ بالنسخ السابقة. متابعة؟'))return;
+ restorePdfDocId=id;el('restorePdfFile').click();
+}
+async function restorePdfChosen(event){
+ const file=event.target.files[0];event.target.value='';
+ const id=restorePdfDocId;restorePdfDocId=null;
+ if(!file||!id)return;
+ const doc=docs.find(x=>x.id===id);if(!doc)return;
+ const f=new FormData();f.append('file',file);f.append('expected_version',String(doc.version));
+ notify('جارٍ رفع نسخة PDF الموجودة في الهاتف والتحقق منها…');
+ try{const x=await api(`/api/documents/${encodeURIComponent(id)}/restore-pdf`,{method:'POST',body:f});
+  await refresh();notify(`✅ تم استعادة PDF من الهاتف (${x.pages} صفحة) دون تصوير جديد.`);
+ }catch(err){notify('تعذرت استعادة PDF: '+err.message,true)}
+}
+
+async function openPdf(id){
+ // Open a blank tab synchronously, so Android allows the PDF preview.
+ const page=window.open('', '_blank');
+ if(page){page.document.write('<meta charset="utf-8"><p dir="rtl" style="font-family:Arial">جارٍ فتح المستند…</p>')}
+ try{
+  const r=await fetch(`/api/documents/${encodeURIComponent(id)}/pdf`,{credentials:'same-origin',cache:'no-store'});
+  if(!r.ok){const data=await r.json().catch(()=>({}));throw Error(data.error||'فشل فتح PDF');}
+  if(!r.headers.get('Content-Type')?.includes('application/pdf'))throw Error('لم يرجع الخادم مستند PDF صالحًا');
+  const url=URL.createObjectURL(await r.blob());
+  if(r.headers.get('X-Archive-Recovery')==='backup')notify('عُرضت نسخة احتياطية بنفس عدد الصفحات. افتح التصدير واضغط فحص وإصلاح الأرشيف.');
+  if(page){page.location.href=url}else{const a=document.createElement('a');a.href=url;a.download='teacher-document.pdf';document.body.appendChild(a);a.click();a.remove();}
+  setTimeout(()=>URL.revokeObjectURL(url),5*60*1000);
+ }catch(err){if(page)page.close();notify('تعذّر عرض PDF: '+err.message,true)}
+}
+async function getFile(url){
+ try{
+  const r=await fetch(url,{credentials:'same-origin',cache:'no-store'});
+  if(!r.ok){const d=await r.json().catch(()=>({}));throw Error(d.error||'لم يتم تنزيل المستند');}
+  const type=r.headers.get('Content-Type')||'';
+  if(!type.includes('pdf')&&!type.includes('zip'))throw Error('الخادم لم يرجع ملف PDF أو ZIP صالحًا');
+  const disposition=r.headers.get('Content-Disposition')||'';
+  let name='teacher-file.'+(type.includes('zip')?'zip':'pdf');
+  const encoded=disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  const simple=disposition.match(/filename="?([^";]+)"?/i);
+  if(encoded){try{name=decodeURIComponent(encoded[1])}catch(err){}}
+  else if(simple)name=simple[1];
+  const blob=await r.blob();const address=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=address;a.download=name;
+  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(address),120000);
+  notify('تم تجهيز المستند. راجع التنزيلات في هاتفك.');
+ }catch(e){notify('تعذر التنزيل: '+e.message,true)}
+}
 function showModal(title,html){el('modalTitle').textContent=title;el('modalBody').innerHTML=html;el('modalLayer').classList.remove('hidden')}
 function closeModal(force=false){if(busy&&!force)return notify('جاري حفظ الصورة؛ لا تغلق المعاينة حتى تظهر النتيجة.');el('modalLayer').classList.add('hidden');el('modalBody').innerHTML=''}
 function date(s){return s?new Date(s).toLocaleString('ar-LY',{dateStyle:'short',timeStyle:'short'}):''}
@@ -604,6 +670,10 @@ function renderExports(){
  if(user.role!=='admin')return tab('home');
  const complete=teachers.filter(t=>filled(t.id)===5).length;
  el('view').innerHTML=`<h2 class="section-title">⬇ تنزيل ملفات المعلمين بدون تكرار</h2>
+ <div class="card"><h3>🛠️ فحص وإصلاح روابط PDF القديمة</h3>
+ <p class="muted">إذا ظهر Object not found، يفحص النظام النسخ الموجودة في مجلد المعلم، ويصلح الرابط فقط عند العثور على PDF سليم بنفس عدد الصفحات. لا يحذف أي صور أو ملفات.</p>
+ <button id="repairArchiveButton" class="btn primary full" onclick="repairArchive()">🔍 فحص وإصلاح الأرشيف الموجود</button>
+ <p id="repairArchiveStatus" class="small muted">لم يبدأ الفحص بعد.</p></div>
  <div class="card"><h3>تنزيل ملف معلم واحد</h3><p class="muted">من «المعلمون والأرشيف» افتح اسم المعلم لتنزيل مستنداته منفصلة أو PDF مجمّع.</p>
  <button class="btn secondary" onclick="tab('teachers')">البحث عن معلم</button></div>
  <div class="card"><h3>التنزيل الجماعي</h3><p>المعلمون: <b>${teachers.length}</b> | المكتملون: <b>${complete}</b> | الناقصون: <b>${teachers.length-complete}</b></p>
@@ -671,6 +741,29 @@ function chooseExportAdditions(){
  if(el('zipFormat'))el('zipFormat').value='folders';
  previewExport();
 }
+async function repairArchive(){
+ if(user?.role!=='admin')return;
+ if(!confirm('سيُفحص الأرشيف الموجود دون حذف أو إعادة تصوير. تُصلح روابط المستندات التي لها نسخة سليمة بنفس عدد الصفحات. هل تبدأ؟'))return;
+ const button=el('repairArchiveButton'),status=el('repairArchiveStatus');
+ if(button)button.disabled=true;
+ let healthy=0,repaired=0,issues=[],total=0,checked=0;
+ try{
+  do{
+   if(status)status.textContent=`🔍 جاري فحص الملفات ${checked} من ${total||'…'} — تم إصلاح ${repaired}`;
+   const result=await api('/api/archive/repair',{method:'POST',body:JSON.stringify({start:checked,count:10})});
+   total=result.total;checked+=result.checked;healthy+=result.healthy;repaired+=result.repaired;
+   issues.push(...result.issues);
+   if(!result.checked)break;
+   if(status)status.textContent=`🔍 تم فحص ${checked}/${total}. سليمة: ${healthy} • أُصلحت: ${repaired} • تحتاج مراجعة: ${issues.length}`;
+  }while(checked<total);
+  await refresh();
+  const body=issues.map(x=>`<div class="missing-row"><b>${esc(x.name)} — ${esc(x.kind)}</b><p class="small red">${esc(x.reason)}</p></div>`).join('');
+  showModal('نتيجة فحص ملفات PDF',`<div class="batch-note">المفحوصة: <b>${checked}</b>، السليمة: <b>${healthy}</b>، الروابط التي أُصلحت: <b>${repaired}</b>، المتبقية للمراجعة: <b>${issues.length}</b>.</div>${body||'<p class="ok">✅ لم تُكتشف أخطاء إضافية في المستندات المفحوصة.</p>'}<button class="btn secondary full" onclick="closeModal()">إغلاق</button>`);
+ }catch(err){notify('توقف الفحص عند '+checked+' مستندًا: '+err.message+' — يمكن إعادته دون حذف الملفات',true);}
+ finally{const button2=el('repairArchiveButton');if(button2)button2.disabled=false;
+   const state=el('repairArchiveStatus');if(state)state.textContent=`تم فحص ${checked}/${total||'؟'} • أصلحت ${repaired} • تحتاج مراجعة ${issues.length}`;}
+}
+
 async function previewExport(){
  const status=el('zipStatus')?.value||'all';
  const formatNode=el('zipFormat');
