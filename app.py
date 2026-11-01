@@ -1739,6 +1739,128 @@ def _build_flat_export(batch, teacher_lookup, available_only=False):
         raise
 
 
+
+
+# V11: private, time-limited direct download manifest. Nothing is deleted or
+# rewritten in Storage; this route signs existing *snapshot* paths only.
+@app.get("/api/export/batch/<batch_id>/direct-manifest")
+@login_required(roles=("admin",))
+def direct_export_manifest(batch_id):
+    batch = user_batch(batch_id)
+    if batch["output_format"] != "folders":
+        raise UserError("التنزيل السريع يحتاج خيار ملفات PDF منفصلة في مجلد واحد.", 400)
+    rows = batch.get("payload") or []
+    if not rows:
+        raise UserError("لا توجد مستندات في هذه الدفعة.", 400)
+
+    items = []
+    failures = []
+    used_names = set()
+    for teacher in rows:
+        for item in teacher.get("files") or []:
+            kind = item.get("kind")
+            if kind not in KINDS or not item.get("path"):
+                failures.append({"teacher": teacher.get("name", "—"),
+                                 "kind": KINDS.get(kind, kind or "—"),
+                                 "reason": "مسار المستند غير صالح"})
+                continue
+            name = _flat_export_filename(
+                {"full_name": teacher.get("name") or "معلم",
+                 "id": teacher["id"]}, kind, used_names)
+            items.append({"teacher_id": teacher["id"],
+                          "teacher": teacher.get("name") or "—",
+                          "kind": kind, "kind_title": KINDS[kind],
+                          "path": item["path"],
+                          "version": int(item.get("version") or 1),
+                          "filename": name})
+    if not items:
+        raise UserError("لا توجد مسارات PDF صالحة لهذه الدفعة.", 409)
+
+    # Batch-sign; never expose the service role key. Signed URLs are bearer
+    # credentials limited to specific objects and expire after one hour.
+    base = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    from urllib.parse import urljoin, urlparse
+    expected_host = urlparse(base).netloc
+    if not expected_host:
+        raise UserError("إعداد عنوان Supabase غير صحيح.", 503)
+    outputs = []
+    for start in range(0, len(items), 70):
+        group = items[start:start + 70]
+        try:
+            signed = read_with_retry(
+                lambda: storage().create_signed_urls([x["path"] for x in group], 3600))
+            if not isinstance(signed, list) or len(signed) != len(group):
+                raise ValueError("Unexpected signed-url response")
+        except Exception:
+            app.logger.warning("Bulk signed URL request failed for %d files", len(group), exc_info=True)
+            raise UserError("تعذر إصدار روابط التنزيل السريع. جرّب من جديد أو استخدم التنزيل الاحتياطي.", 503)
+        for item, link in zip(group, signed):
+            raw = (link.get("signedURL") or link.get("signedUrl") or "") if isinstance(link, dict) else ""
+            if not raw or (isinstance(link, dict) and link.get("error")):
+                failures.append({"teacher": item["teacher"], "kind": item["kind_title"],
+                                 "reason": "المستند غير متاح للتنزيل المباشر"})
+                continue
+            if raw.startswith("/object/"):
+                uri = base + "/storage/v1" + raw
+            elif raw.startswith("/storage/v1/"):
+                uri = base + raw
+            else:
+                uri = urljoin(base + "/storage/v1/", raw)
+            parsed = urlparse(uri)
+            if (parsed.scheme != "https" or parsed.netloc != expected_host
+                    or not parsed.path.startswith("/storage/v1/object/sign/")):
+                app.logger.error("Invalid signed Storage URL for kind %s", item["kind"])
+                failures.append({"teacher": item["teacher"], "kind": item["kind_title"],
+                                 "reason": "رابط التخزين غير صالح"})
+                continue
+            outputs.append({**item, "url": uri})
+    name = (rows[0].get("batch_name") or "الدفعة").strip()
+    return jsonify(batch_id=batch["id"], batch_name=clean(name, 70),
+                   expected=len(items) + len([x for x in failures if x["reason"] == "مسار المستند غير صالح"]),
+                   items=outputs, problems=failures, expires_seconds=3600)
+
+
+@app.post("/api/export/batch/<batch_id>/direct-record")
+@login_required(roles=("admin",))
+def direct_record_export(batch_id):
+    """Store only proven-to-be-packaged files, not a download confirmation.
+
+    The user must subsequently confirm the ZIP was received and opened on
+    their phone via the pre-existing /api/export/confirm-available route.
+    """
+    batch = user_batch(batch_id)
+    if batch.get("confirmed_at"):
+        raise UserError("سبق تأكيد هذه الدفعة. جهز دفعة جديدة.", 409)
+    if batch["output_format"] != "folders":
+        raise UserError("التنزيل السريع يدعم PDF المنفصلة فقط.", 400)
+    data = request.get_json(silent=True) or {}
+    delivered = data.get("files")
+    if not isinstance(delivered, list) or not 1 <= len(delivered) <= 2000:
+        raise UserError("قائمة المستندات التي تم تجهيزها غير صحيحة.", 400)
+    indexed = {}
+    for teacher in batch.get("payload") or []:
+        for f in teacher.get("files") or []:
+            indexed[(teacher["id"], f["kind"])] = f
+    accepted, seen = {}, set()
+    for value in delivered:
+        if not isinstance(value, dict):
+            raise UserError("قائمة المستندات غير صحيحة.", 400)
+        key = (value.get("teacher_id"), value.get("kind"))
+        f = indexed.get(key)
+        if (not f or key in seen or value.get("path") != f.get("path")
+                or str(value.get("version")) != str(f.get("version"))):
+            raise UserError("أحد المستندات لا يطابق الدفعة الأصلية؛ لن يتم تسجيله.", 409)
+        seen.add(key)
+        accepted.setdefault(key[0], []).append({"kind": key[1],
+                                                 "path": f["path"],
+                                                 "version": f["version"]})
+    stamp = datetime.now(timezone.utc).isoformat()
+    changed = [{**teacher, "available_files": accepted.get(teacher["id"], []),
+                "available_built_at": stamp} for teacher in batch["payload"]]
+    table("export_batches").update({"payload": changed}).eq("id", batch["id"]).eq(
+        "actor_id", request.current_user["id"]).is_("confirmed_at", "null").execute()
+    return jsonify(ok=True, count=len(seen))
+
 @app.get("/api/export/batch/<batch_id>/available.zip")
 @login_required(roles=("admin",))
 def get_available_export_batch(batch_id):
