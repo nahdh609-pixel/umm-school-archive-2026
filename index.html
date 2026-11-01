@@ -51,6 +51,33 @@
 .previous-select label{display:flex;gap:9px;align-items:center;border-bottom:1px solid #edf0f3;padding:10px 6px;cursor:pointer}
 .previous-select input{width:20px;height:20px}
 @media(max-width:550px){.event-card .actionrow .btn{flex:1 1 auto}.export-metrics{gap:5px}.export-metric{padding:8px 3px}}
+
+/* V8.2: official A4 teacher missing-documents report; manager only. */
+#printReport{display:none}
+#printReport .report-title{font-size:19px;font-weight:800;margin:8px 0;text-align:center}
+#printReport .report-subtitle{text-align:center;margin:0 0 10px}
+#printReport .report-meta{display:flex;justify-content:space-between;gap:12px;margin:14px 0;font-weight:700}
+#printReport .report-table{width:100%;border-collapse:collapse;table-layout:fixed;direction:rtl}
+#printReport .report-table th,#printReport .report-table td{border:1px solid #333;padding:7px 6px;vertical-align:top;text-align:right;overflow-wrap:anywhere}
+#printReport .report-table th{background:#ededed;font-weight:800;text-align:center}
+#printReport .report-table td:first-child,#printReport .report-table td:nth-child(4){text-align:center}
+#printReport .report-foot{margin-top:12px;font-size:11px}
+@page{size:A4 portrait;margin:13mm 11mm}
+@media print{
+ html,body{margin:0!important;padding:0!important;background:white!important;color:#000!important;font-family:Tahoma,Arial,sans-serif!important;font-size:11pt!important}
+ body>*:not(#printReport){display:none!important}
+ #printReport{display:block!important;width:100%!important;margin:0!important;padding:0!important;background:#fff!important;color:#000!important}
+ #printReport .report-school{text-align:center;font-size:17pt;font-weight:800}
+ #printReport .report-title{font-size:15pt;margin:8px 0}
+ #printReport .report-subtitle{font-size:10pt}
+ #printReport .report-meta{font-size:10pt}
+ #printReport .report-table{font-size:9.3pt}
+ #printReport .report-table th,#printReport .report-table td{padding:5px 5px;border-color:#111}
+ #printReport .report-table th{background:#ececec!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+ #printReport .report-table thead{display:table-header-group}
+ #printReport .report-table tbody tr{break-inside:avoid;page-break-inside:avoid}
+ #printReport .report-foot{break-inside:avoid;page-break-inside:avoid}
+}
 </style>
 </head>
 <body>
@@ -58,6 +85,7 @@
 <div id="mainScreen" class="hidden"><header class="top"><div class="topinner"><div class="brand">🗂️ أرشيف المعلمين<small>مدرسة أم المؤمنين للتعليم الأساسي</small></div><div class="flex"><span id="who" class="small"></span><button class="btn sm outline" onclick="logout()">خروج</button></div></div></header><main class="shell"><div class="nav"><button data-tab="home" class="on" onclick="tab('home')">الرئيسية</button><button data-tab="notifications" id="navNotifications" onclick="tab('notifications')">🔔 الإشعارات <span id="unreadBadge" class="event-badge hidden">0</span></button><button data-tab="teachers" onclick="tab('teachers')">المعلمون والأرشيف</button><button data-tab="users" id="navUsers" onclick="tab('users')">المستخدمون</button><button data-tab="exports" onclick="tab('exports')">التصدير</button></div><div id="view" style="margin-top:16px"></div></main><footer class="foot">الأرشيف الإلكتروني — المستندات خاصة ولا تظهر إلا للمستخدمين المصرّح لهم</footer></div>
 <div id="modalLayer" class="overlay hidden"><div class="modal"><div class="between"><h2 id="modalTitle" style="margin:0"></h2><button class="btn sm secondary" onclick="closeModal()">✕ إغلاق</button></div><div id="modalBody" style="margin-top:14px"></div></div></div>
 <div id="toast" class="toast hidden"></div>
+<div id="printReport" lang="ar" dir="rtl" aria-hidden="true"></div>
 <input id="camera" type="file" accept="image/*" capture="environment" class="hidden" onchange="picked(event)">
 <input id="gallery" type="file" accept="image/*" multiple class="hidden" onchange="picked(event)">
 <input id="excel" type="file" accept=".xlsx,.csv" class="hidden" onchange="importExcel(event)">
@@ -108,6 +136,39 @@ function renderMissingCards(){
 }
 function moreMissing(){missingLimit+=40;renderMissingCards()}
 
+/* Manager-only report. Fetch fresh server state so scans saved on other devices
+   are reflected immediately rather than printing a stale browser list. */
+async function printMissingReport(){
+ if(!user || user.role!=='admin') return notify('هذا التقرير متاح للمدير فقط',true);
+ const report=el('printReport');
+ if(!report) return notify('تعذر تجهيز صفحة الطباعة',true);
+ try{
+   const data=await api('/api/state');
+   const recentTeachers=Array.isArray(data.teachers)?data.teachers:[];
+   const recentDocs=Array.isArray(data.documents)?data.documents:[];
+   const existing=new Set(recentDocs.map(d=>`${d.teacher_id}:${d.kind}`));
+   const deficits=recentTeachers.map(t=>{
+     const missing=Object.entries(kinds).filter(([kind])=>!existing.has(`${t.id}:${kind}`)).map(([,name])=>name);
+     return {teacher:t,missing,available:5-missing.length};
+   }).filter(item=>item.missing.length>0).sort((a,b)=>a.teacher.full_name.localeCompare(b.teacher.full_name,'ar'));
+   const now=new Date().toLocaleString('ar-LY',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+   const rows=deficits.map((x,i)=>`<tr><td>${i+1}</td><td>${esc(x.teacher.full_name)}</td><td>${esc(x.teacher.position||'—')}</td><td>${x.available}/5</td><td>${esc(x.missing.join('، '))}</td></tr>`).join('');
+   report.innerHTML=`
+     <div class="report-school">مدرسة أم المؤمنين للتعليم الأساسي</div>
+     <div class="report-title">كشف نواقص مستندات المعلمين</div>
+     <p class="report-subtitle">قائمة تُستخرج من سجلات الأرشيف الإلكتروني عند طلب الطباعة</p>
+     <div class="report-meta"><span>تاريخ الطباعة: ${esc(now)}</span><span>عدد المعلمين ذوي النواقص: ${deficits.length}</span></div>
+     <table class="report-table">
+       <colgroup><col style="width:7%"><col style="width:31%"><col style="width:17%"><col style="width:10%"><col style="width:35%"></colgroup>
+       <thead><tr><th>م</th><th>اسم المعلم</th><th>الوظيفة</th><th>الموجود</th><th>المستندات الناقصة</th></tr></thead>
+       <tbody>${rows || '<tr><td colspan="5" style="text-align:center">جميع المعلمين مكتملو المستندات (5/5)</td></tr>'}</tbody>
+     </table>
+     <p class="report-foot">المستندات المطلوبة: مباشرة العمل، قرار التعيين، شهادة الميلاد، استمرارية العمل، المؤهل العلمي.</p>`;
+   window.print();
+ }catch(err){notify('تعذر إعداد تقرير النواقص: '+err.message,true)}
+}
+
+
 function tab(t){if(user?.role==='scanner'&&t!=='teachers')return;if(t==='notifications'&&user?.role!=='admin')return;activeTab=t;pickedTeacher=null;searchText='';document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));render()}
 function render(){if(!user)return;document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===activeTab));if(activeTab==='home')renderHome();if(activeTab==='notifications')renderNotifications();if(activeTab==='teachers')renderTeachers();if(activeTab==='users')renderUsers();if(activeTab==='exports')renderExports()}
 function renderHome(){
@@ -122,7 +183,8 @@ function renderHome(){
  el('view').innerHTML=`<h2 class="section-title">لوحة المتابعة</h2>
  <div class="statgrid"><div class="stat"><strong>${teachers.length}</strong><span>إجمالي المعلمين</span></div><div class="stat"><strong>${done}</strong><span>ملفات مكتملة</span></div><div class="stat"><strong>${teachers.length-done}</strong><span>ملفات غير مكتملة</span></div><div class="stat"><strong>${count}</strong><span>مستندات PDF محفوظة</span></div></div>
  <div class="card" style="margin-top:16px"><div class="between"><h3 style="margin:0">🔔 إشعارات إضافة وتعديل ملفات المعلمين</h3><button class="btn sm primary" onclick="tab('notifications')">عرض الإشعارات <span class="event-badge ${unreadNotifications?'':'hidden'}">${unreadNotifications}</span></button></div><div id="homeNotifications" style="margin-top:12px">${notificationItems.slice(0,4).map(notificationCard).join('')||'<p class="muted">لا توجد إشعارات جديدة بعد.</p>'}</div></div>
- <div class="card"><h3>📋 كشف نواقص المعلمين (الاسم والمسوغات الناقصة)</h3>
+ <div class="card"><div class="between"><h3 style="margin:0">📋 كشف نواقص المعلمين (الاسم والمسوغات الناقصة)</h3>${user.role==='admin'?'<button type="button" class="btn dark" onclick="printMissingReport()">🖨️ طباعة كشف النواقص</button>':''}</div>
+ <p class="small muted">الطباعة تشمل جميع المعلمين غير المكتملين، حتى لو كنت تبحث حاليًا عن اسم واحد.</p>
  <div class="field"><label>البحث باسم المعلم أو رقم وطني أو اسم المستند الناقص</label>
  <input class="search" id="missingSearchInput" placeholder="ابحث في جميع المعلمين الناقصين..." value="${esc(missingSearch)}" oninput="missingSearch=this.value;missingLimit=35;renderMissingCards()"></div>
  <p class="muted small" id="missingCount"></p><div id="missingRows"></div>
