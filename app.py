@@ -223,7 +223,13 @@ def home():
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True)
+    return jsonify(ok=True, version="V10-DARK-20261101")
+
+
+@app.get("/api/version")
+def public_version():
+    """Deployment health indicator only; never expose customer records or keys."""
+    return jsonify(version="V10-DARK-20261101", theme="dark", download="native-zip")
 
 
 @app.post("/api/login")
@@ -1066,15 +1072,27 @@ def export_inventory(status="all", output_format="folders"):
                          ensure_ascii=False, separators=(",", ":"))
         fingerprint = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         prev = indexed.get((teacher["id"], output_format))
-        state = "new" if not prev else "previous" if prev["fingerprint"] == fingerprint else "updated"
-        added_kinds = ([kind for kind in KINDS if kind in td and
-                       (teacher["id"], output_format, kind) not in file_index]
-                       if prev else [])
+        confirmed = {kind: file_index.get((teacher["id"], output_format, kind))
+                     for kind in KINDS if kind in td}
+        has_confirmed = bool(prev) or any(confirmed.values())
+        pending_kinds = [kind for kind in KINDS if kind in td and not (
+            confirmed[kind]
+            and confirmed[kind]["storage_path"] == td[kind]["storage_path"]
+            and int(confirmed[kind]["version"]) == int(td[kind].get("version") or 1)
+        )]
+        # A batch with some files delivered and others missing is NOT all-new.
+        # Missing kinds stay pending; confirmed PDFs are not downloaded twice.
+        state = ("new" if not has_confirmed else
+                 "previous" if not pending_kinds and (not prev or prev["fingerprint"] == fingerprint)
+                 else "updated")
+        added_kinds = ([kind for kind in KINDS if kind in td and not confirmed[kind]]
+                       if has_confirmed else [])
         result.append({
             "id": teacher["id"], "name": teacher["full_name"], "document_count": n,
             "missing": [label for key, label in KINDS.items() if key not in td],
             "fingerprint": fingerprint, "download_state": state,
             "additions": added_kinds, "additions_count": len(added_kinds),
+            "pending_kinds": pending_kinds,
             "exported_at": prev.get("exported_at") if prev else None,
             "files": [{"kind": k, "path": td[k]["storage_path"],
                        "version": int(td[k].get("version") or 1)} for k in KINDS if k in td],
@@ -1139,13 +1157,17 @@ def prepare_export():
     for item in chosen:
         # The exact PDF paths must be frozen at prepare time; never silently
         # export newer files than the user confirmed.
+        # Pending defaults to only missing / changed kinds from the confirmed
+        # per-document record, not every PDF in the teacher's file.
         files = ([f for f in item["files"] if f["kind"] in item["additions"]]
-                 if selection == "additions" else item["files"])
+                 if selection == "additions" else
+                 [f for f in item["files"] if f["kind"] in item["pending_kinds"]]
+                 if selection in ("pending", "new", "updated") else item["files"])
         if not files:
             raise UserError("هذه الدفعة لا تحتوي مستندات قابلة للتنزيل")
         payload.append({"id": item["id"], "name": item["name"],
                         "fingerprint": item["fingerprint"], "files": files,
-                        "complete_snapshot": selection != "additions",
+                        "complete_snapshot": len(files) == len(item["files"]),
                         "selection": selection, "layout": layout,
                         "batch_name": batch_name})
     try:
@@ -1664,6 +1686,9 @@ def _build_flat_export(batch, teacher_lookup, available_only=False):
                     success.append(resolved)
                     if temp.tell() > max_size:
                         raise UserError("حجم الدفعة تجاوز 350 ميغابايت. نزّل دفعات أصغر حفاظًا على سرعة الهاتف.", 413)
+                if available_only and success:
+                    resolved_payload.append({**row, "files": success,
+                                             "complete_snapshot": False})
                 if not available_only:
                     # Keep the full teacher fingerprint when all kinds were included.
                     # For additions only, confirmation stores per-document versions.
@@ -1707,7 +1732,7 @@ def _build_flat_export(batch, teacher_lookup, available_only=False):
             entry_count = len(names)
         temp.seek(0)
         if available_only:
-            return temp, size, entry_count, len(good), len(bad), len(payload)
+            return temp, size, entry_count, len(good), len(bad), len(payload), resolved_payload
         return temp, size, entry_count, resolved_payload
     except Exception:
         temp.close()
@@ -1722,9 +1747,23 @@ def get_available_export_batch(batch_id):
     teachers_lookup = {t["id"]: t for t in all_records("teachers", "id,full_name,national_id,position")}
     flat = batch.get("output_format") == "folders" and any(
         row.get("layout") == "flat" for row in batch.get("payload") or [])
-    handle, size, entries, pdfs, missing, folders = (
-        _build_flat_export(batch, teachers_lookup, available_only=True)
-        if flat else _build_available_export(batch, teachers_lookup))
+    if flat:
+        handle, size, entries, pdfs, missing, folders, delivered = _build_flat_export(
+            batch, teachers_lookup, available_only=True)
+        # Never auto-confirm. Store only a snapshot of files proven present in ZIP.
+        by_id = {r["id"]: r["files"] for r in delivered}
+        now_stamp = datetime.now(timezone.utc).isoformat()
+        updated_payload = [{**row, "available_files": by_id.get(row["id"], []),
+                            "available_built_at": now_stamp} for row in batch["payload"]]
+        try:
+            table("export_batches").update({"payload": updated_payload}).eq(
+                "id", batch["id"]).eq("actor_id", request.current_user["id"]).execute()
+        except Exception:
+            handle.close()
+            raise UserError("تعذر تسجيل قائمة المستندات الجاهزة للتنزيل؛ أعد المحاولة دون حذف أي ملف.", 503)
+    else:
+        handle, size, entries, pdfs, missing, folders = _build_available_export(
+            batch, teachers_lookup)
     label = clean((batch.get("payload") or [{}])[0].get("batch_name") or "دفعة", 40)
     filename = (f"{label}_available_{pdfs}_pdf_"
                 f"{missing}_missing_{batch['id'][:8]}.zip")
@@ -1738,6 +1777,77 @@ def get_available_export_batch(batch_id):
     response.headers["X-Archive-Entries"] = str(entries)
     response.call_on_close(handle.close)
     return response
+
+
+@app.post("/api/export/confirm-available")
+@login_required(roles=("admin",))
+def confirm_available_export():
+    """Confirm a partially available ZIP only after manual phone verification.
+
+    Never mark absent PDFs as downloaded, and never delete any storage object.
+    Uses the already present archive_export_document_history table (V9).
+    """
+    data = request.get_json(silent=True) or {}
+    batch = user_batch(data.get("batch_id"))
+    if batch.get("confirmed_at"):
+        return jsonify(ok=True, already_confirmed=True, count=0)
+    if batch["output_format"] != "folders":
+        raise UserError("التأكيد الجزئي متاح لمجلد PDF المنفصل فقط.", 400)
+    if not batch.get("payload") or any(not row.get("available_built_at") for row in batch["payload"]):
+        raise UserError("لم يُجهز ملف المستندات المتاحة بعد. نزّله أولًا وتأكد من وصوله.", 409)
+    # Reconcile every file against LIVE document version, to avoid claiming a
+    # different document was saved while another scanner was editing it.
+    live = all_records("documents", "teacher_id,kind,storage_path,version", "created_at")
+    index = {(r["teacher_id"], r["kind"]): r for r in live}
+    stamp = datetime.now(timezone.utc).isoformat()
+    rows, skipped = [], 0
+    seen = set()
+    for teacher in batch["payload"]:
+        for item in teacher.get("available_files") or []:
+            key = (teacher["id"], item["kind"])
+            doc = index.get(key)
+            if not doc or doc["storage_path"] != item["path"] or int(doc["version"]) != int(item["version"]):
+                skipped += 1
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({"teacher_id": teacher["id"], "output_format": "folders",
+                         "kind": item["kind"], "storage_path": item["path"],
+                         "version": item["version"], "exported_at": stamp})
+    if not rows:
+        raise UserError("لا يوجد مستند مطابق للنسخة الحالية للتأكيد؛ أعد تجهيز الدفعة.", 409)
+    for offset in range(0, len(rows), 200):
+        table("export_document_history").upsert(rows[offset:offset+200],
+            on_conflict="teacher_id,output_format,kind").execute()
+    # A teacher is fully downloaded only when ALL current kinds match confirmed PDFs.
+    history = all_export_document_snapshots()
+    histories = {(r["teacher_id"], r["output_format"], r["kind"]): r for r in history}
+    teacher_data = {t["id"]: t for t in all_records("teachers", "id,full_name,national_id")}
+    grouped = {}
+    for doc in live:
+        grouped.setdefault(doc["teacher_id"], {})[doc["kind"]] = doc
+    reconciled = []
+    for ident in {r["teacher_id"] for r in rows}:
+        info, current = teacher_data.get(ident), grouped.get(ident, {})
+        if not info or not current:
+            continue
+        if all((histories.get((ident, "folders", kind)) or {}).get("storage_path") == doc["storage_path"]
+               and int((histories.get((ident, "folders", kind)) or {}).get("version") or 0) == int(doc["version"])
+               for kind, doc in current.items()):
+            parts = [[kind, int(current[kind]["version"]), current[kind]["storage_path"]]
+                     for kind in KINDS if kind in current]
+            raw = json.dumps([info["full_name"], info["national_id"], parts],
+                             ensure_ascii=False, separators=(",", ":"))
+            reconciled.append({"teacher_id": ident, "output_format": "folders",
+                               "fingerprint": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                               "exported_at": stamp, "exported_by": request.current_user["id"]})
+    if reconciled:
+        table("export_history").upsert(reconciled, on_conflict="teacher_id,output_format").execute()
+    table("export_batches").update({"confirmed_at": stamp}).eq("id", batch["id"]).is_(
+        "confirmed_at", "null").execute()
+    audit("تأكيد ملفات ZIP المتاحة فقط", f"{len(rows)} ملف PDF • لم يُؤكد {skipped} ملف تغيّر")
+    return jsonify(ok=True, count=len(rows), changed=skipped)
 
 
 @app.get("/api/export/batch/<batch_id>.zip")
