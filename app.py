@@ -4,7 +4,9 @@ import hashlib
 import io
 import tempfile
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 import json
 import logging
 import os
@@ -1083,87 +1085,169 @@ def user_batch(batch_id):
     return batch
 
 
-def _export_pdf_with_retries(item, teacher_name):
-    """Retry transient storage failures; report the exact teacher/document.
+class StorageFetchError(Exception):
+    """Storage transport error; only a status code is shown, never credentials."""
+    def __init__(self, code=None, message=""):
+        self.code = code
+        self.message = str(message)[:180]
+        super().__init__(self.message)
 
-    Do not substitute an empty PDF, silently skip a document, or mutate its
-    storage path. This is solely for the privileged admin ZIP operation.
+
+def _direct_private_pdf(path):
+    """Download using the documented private Storage API, with an explicit timeout.
+
+    Each call opens its own connection. This avoids concurrent use of one SDK
+    HTTP client when a large ZIP is being assembled on a small Render instance.
+    The service-role key NEVER goes into the browser or a ZIP file.
+    """
+    base = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    token = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not base or not token:
+        raise UserError("إعدادات تخزين Supabase غير موجودة في Render.", 503)
+    if not isinstance(path, str) or not path or "\x00" in path or path.startswith("/"):
+        raise UserError("مسار المستند غير صالح.", 422)
+    endpoint = base + "/storage/v1/object/authenticated/" + quote(BUCKET, safe="") + "/" + quote(path, safe="/")
+    req = Request(endpoint, method="GET", headers={
+        "Authorization": "Bearer " + token,
+        "apikey": token,
+        "Accept": "application/pdf",
+    })
+    try:
+        with urlopen(req, timeout=24) as res:
+            if res.status != 200:
+                raise StorageFetchError(res.status, "غير متاح")
+            data = res.read(30 * 1024 * 1024 + 1)
+            if len(data) > 30 * 1024 * 1024:
+                raise UserError("مستند PDF أكبر من 30 ميغابايت؛ نزّل ملف المعلم منفردًا.", 413)
+            if not data.startswith(b"%PDF"):
+                raise UserError("محتوى المستند في التخزين ليس ملف PDF سليمًا.", 422)
+            return data
+    except HTTPError as exc:
+        # Don't put the body into logs; Supabase's body can contain internal data.
+        raise StorageFetchError(exc.code, "رفضت خدمة التخزين الطلب") from exc
+    except (URLError, OSError, TimeoutError) as exc:
+        raise StorageFetchError(None, type(exc).__name__) from exc
+
+
+def _export_pdf_with_retries(item, teacher_name, teacher_id):
+    """Resolve edited PDF paths, retry genuine temporary errors and never drop PDFs.
+
+    Old versions are deleted by save_doc after an edit. A prepared export may
+    still refer to that old path, which is PERMANENTLY 404. We must refresh the
+    current document row, not keep retrying an obsolete path four times.
     """
     kind = item.get("kind")
-    label = KINDS.get(kind, str(kind or "مستند"))
-    path = item.get("path")
-    if not path:
-        raise UserError(f"مسار مستند {label} للمعلم {teacher_name} غير موجود؛ راجع ملف المعلم.", 409)
-    for attempt in range(4):
+    title = KINDS.get(kind, str(kind or "مستند"))
+    selected = dict(item)
+    if not selected.get("path"):
+        raise UserError(f"مسار {title} للمعلم {teacher_name} غير مسجل.", 409)
+    last_code = None
+    # Bounded total retries. Usually one call is enough; 429/5xx back off.
+    for attempt in range(6):
         try:
-            blob = storage().download(path)
-            if not isinstance(blob, bytes) or not blob.startswith(b"%PDF"):
-                raise UserError(f"ملف {label} للمعلم {teacher_name} غير صالح كملف PDF. افحصه في أرشيف المعلم.", 422)
-            return blob
+            return _direct_private_pdf(selected["path"]), selected
         except UserError:
             raise
-        except Exception as exc:
-            app.logger.warning("Archive PDF download failed; kind=%s attempt=%s/4", kind, attempt + 1,
-                               exc_info=attempt == 3)
-            if attempt == 3:
+        except StorageFetchError as exc:
+            last_code = exc.code
+            app.logger.warning("Archive Storage read failed: teacher=%s kind=%s http=%s attempt=%s/6",
+                               teacher_id, kind, exc.code or "network", attempt + 1)
+            if exc.code in (401, 403):
+                raise UserError(f"تعذّر الوصول إلى تخزين {title} للمعلم {teacher_name} (رمز {exc.code}). تحقق من صلاحيات التخزين في Render.", 503) from exc
+            if exc.code in (400, 404, 410):
+                # A simultaneous scan may have changed storage_path/version.
+                latest = find_doc(teacher_id, kind)
+                if latest and latest["storage_path"] != selected["path"]:
+                    selected["path"] = latest["storage_path"]
+                    selected["version"] = int(latest.get("version") or 1)
+                    continue
+                # In case an older Storage server doesn't support the documented
+                # authenticated route, try the already configured SDK once.
+                if exc.code in (400, 404) and attempt == 0:
+                    try:
+                        blob = storage().download(selected["path"])
+                        if isinstance(blob, bytes) and blob.startswith(b"%PDF"):
+                            return blob, selected
+                    except Exception:
+                        app.logger.info("SDK fallback could not read teacher=%s kind=%s", teacher_id, kind)
                 raise UserError(
-                    f"تعذّر تنزيل {label} للمعلم {teacher_name} بعد أربع محاولات. "
-                    "افتح PDF الخاص به وتأكد من وجوده في التخزين ثم أعد التنزيل. "
-                    "لم يُنشأ ZIP ناقص.", 503) from exc
-            time.sleep((0.6, 1.2, 2.0)[attempt])
+                    f"تعذّر الوصول إلى {title} للمعلم {teacher_name} (رمز {exc.code}). "
+                    "المسار الحالي غير متاح من تخزين Supabase؛ افحص عرض PDF لهذا المستند. "
+                    "لم يتم حذف أي ملف أو إرسال ZIP ناقص.", 503) from exc
+            if attempt == 5:
+                break
+            time.sleep((0.4, 0.9, 1.7, 3.3, 5.5)[attempt])
+    raise UserError(
+        f"فشل اتصال Supabase أثناء تنزيل {title} للمعلم {teacher_name} "
+        f"(رمز {last_code or 'شبكة'}). أعد التنزيل بعد تحسن الاتصال؛ لم تُحذف الملفات.", 503)
 
 
 def _build_complete_export(batch, teacher_lookup):
-    """Build and verify a ZIP BEFORE sending HTTP bytes.
+    """Build entire ZIP in private temporary storage and verify it first.
 
-    The old streamed ZIP could stop mid-download when the free instance was
-    interrupted or one storage fetch failed; the browser then received a
-    partial ZIP while the UI still showed the expected teacher count.
+    Uses the latest DB paths; saves precisely the paths actually included into
+    the batch so the later confirmation cannot incorrectly mark stale PDFs.
     """
     payload = batch["payload"]
-    handle = tempfile.TemporaryFile(mode="w+b")  # ephemeral, deleted on close
-    MAX_ARCHIVE_BYTES = 350 * 1024 * 1024
+    handle = tempfile.TemporaryFile(mode="w+b")
+    max_size = 350 * 1024 * 1024
     num_files = 0
+    resolved_payload = []
     try:
+        latest_documents = all_records("documents", "teacher_id,kind,storage_path,version", "created_at")
+        latest_index = {(d["teacher_id"], d["kind"]): d for d in latest_documents}
         manifest = io.StringIO()
         csv_writer = csv.writer(manifest)
         csv_writer.writerow(["اسم المعلم", "اسم المستند", "عدد المستندات في الدفعة"])
-        with zipfile.ZipFile(handle, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive, \
-                ThreadPoolExecutor(max_workers=3) as fetch_pool:
+        with zipfile.ZipFile(handle, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
             for row in payload:
                 teacher = teacher_lookup.get(row["id"])
                 if not teacher:
-                    raise UserError("أحد المعلمين في الدفعة لم يعد موجودًا؛ جهّز دفعة جديدة.", 409)
-                files = row.get("files") or []
-                if not files:
-                    raise UserError("أحد ملفات المعلمين فارغ؛ أعد تجهيز الدفعة.", 409)
+                    raise UserError("أحد المعلمين حُذف بعد تجهيز الدفعة؛ أعد تجهيز القائمة.", 409)
+                original_files = row.get("files") or []
+                if not original_files:
+                    raise UserError("وجدنا معلمًا بلا مستندات في الدفعة؛ أعد تجهيزها.", 409)
+                # IMPORTANT: do not use a frozen old storage path after edits.
+                files = []
+                for f in original_files:
+                    key = (row["id"], f["kind"])
+                    current = latest_index.get(key)
+                    if not current:
+                        raise UserError(
+                            f"مستند {KINDS.get(f['kind'],f['kind'])} للمعلم "
+                            f"{teacher['full_name']} حُذف بعد تجهيز الدفعة. أعد تجهيزها.", 409)
+                    files.append({"kind": f["kind"], "path": current["storage_path"],
+                                  "version": int(current.get("version") or 1)})
                 label = f"{clean(teacher['full_name'])}_{clean(teacher['national_id'][-4:])}_{teacher['id'][:6]}"
-                # Fetch no more than five images for a teacher at once. This
-                # speeds up large batches without keeping every PDF in memory.
-                tasks = {f["kind"]: fetch_pool.submit(_export_pdf_with_retries, f, teacher["full_name"]) for f in files}
+                resolved_files = []
                 if batch["output_format"] == "pdf":
                     writer = PdfWriter()
                     for item in files:
-                        blob = tasks[item["kind"]].result(timeout=115)
-                        if not blob.startswith(b"%PDF"):
-                            raise UserError(f"ملف PDF غير صالح للمعلم {teacher['full_name']}")
-                        writer.append(io.BytesIO(blob))
-                        csv_writer.writerow([teacher["full_name"], KINDS.get(item["kind"], item["kind"]), len(files)])
+                        pdf_bytes, resolved = _export_pdf_with_retries(item, teacher["full_name"], row["id"])
+                        writer.append(io.BytesIO(pdf_bytes))
+                        resolved_files.append(resolved)
+                        csv_writer.writerow([teacher["full_name"], KINDS[resolved["kind"]], len(files)])
                     merged = io.BytesIO()
                     writer.write(merged)
                     archive.writestr(f"{label}.pdf", merged.getvalue())
                     num_files += 1
                 else:
                     for item in files:
-                        blob = tasks[item["kind"]].result(timeout=115)
-                        if not blob.startswith(b"%PDF"):
-                            raise UserError(f"ملف PDF غير صالح للمعلم {teacher['full_name']}")
-                        entry = f"{label}/{clean(KINDS[item['kind']])}.pdf"
-                        archive.writestr(entry, blob)
-                        csv_writer.writerow([teacher["full_name"], KINDS[item["kind"]], len(files)])
+                        pdf_bytes, resolved = _export_pdf_with_retries(item, teacher["full_name"], row["id"])
+                        entry = f"{label}/{clean(KINDS[resolved['kind']])}.pdf"
+                        archive.writestr(entry, pdf_bytes)
+                        resolved_files.append(resolved)
+                        csv_writer.writerow([teacher["full_name"], KINDS[resolved["kind"]], len(files)])
                         num_files += 1
-                if handle.tell() > MAX_ARCHIVE_BYTES:
-                    raise UserError("ملف ZIP أكبر من الحد الآمن للجهاز؛ قلّل عدد المعلمين في الدفعة إلى 10 أو 20.", 413)
+                # Exactly what was sent is recorded; freshly scanned versions
+                # remain detected as 'updated' if not included in this ZIP.
+                parts = [[k, f["version"], f["path"]] for k in KINDS for f in resolved_files if f["kind"] == k]
+                raw = json.dumps([teacher["full_name"], teacher["national_id"], parts],
+                                 ensure_ascii=False, separators=(",", ":"))
+                resolved_payload.append({**row, "files": resolved_files,
+                     "fingerprint": hashlib.sha256(raw.encode("utf-8")).hexdigest()})
+                if handle.tell() > max_size:
+                    raise UserError("الدفعة أكبر من 350 ميغابايت؛ اختر 20 أو 50 معلمًا في كل دفعة.", 413)
             archive.writestr("قائمة_الملفات.csv", "\ufeff" + manifest.getvalue())
             num_files += 1
         handle.flush()
@@ -1171,10 +1255,14 @@ def _build_complete_export(batch, teacher_lookup):
         handle.seek(0)
         with zipfile.ZipFile(handle, "r") as check:
             names = check.namelist()
-            if len(names) != num_files or check.testzip() is not None:
-                raise UserError("فشل التحقق من اكتمال ZIP؛ لم يتم إرسال الملف أو تسجيل تنزيله.", 503)
+            actual_pdfs = sum(n.lower().endswith(".pdf") for n in names)
+            expected = (len(payload) if batch["output_format"] == "pdf"
+                        else sum(len(row["files"]) for row in resolved_payload))
+            if (actual_pdfs != expected or len(names) != num_files
+                    or check.testzip() is not None):
+                raise UserError("فشل التحقق من ZIP؛ لن يتم إرساله أو تسجيله.", 503)
         handle.seek(0)
-        return handle, size, num_files
+        return handle, size, num_files, resolved_payload
     except Exception:
         handle.close()
         raise
@@ -1186,24 +1274,25 @@ def get_export_batch(batch_id):
     batch = user_batch(batch_id)
     lookup = {t["id"]: t for t in all_records("teachers", "id,full_name,national_id,position")}
     try:
-        handle, size, num_files = _build_complete_export(batch, lookup)
+        handle, size, num_files, resolved_payload = _build_complete_export(batch, lookup)
     except UserError:
         raise
     except Exception:
-        app.logger.exception("ZIP creation failed before response")
-        raise UserError("تعذّر إنشاء ZIP بسبب خطأ في الاتصال أو التخزين؛ لم نرسل ملفًا ناقصًا. راجع سجل Render إذا تكرر.", 503)
+        app.logger.exception("Archive ZIP assembly error")
+        raise UserError("تعذّر تجهيز ZIP بسبب خطأ في خدمة التخزين. لم تُحذف ملفات أو تُسجل دفعة تنزيل.", 503)
     try:
         table("export_batches").update({
             "built_at": datetime.now(timezone.utc).isoformat(),
             "built_bytes": size, "built_entries": num_files,
+            "payload": resolved_payload,
         }).eq("id", batch["id"]).execute()
-        name = (f"school_archive_{len(batch['payload'])}_teachers_"
+        name = (f"school_archive_{len(resolved_payload)}_teachers_"
                 f"{datetime.now(timezone.utc).strftime('%Y%m%d')}_{batch['id'][:8]}.zip")
         response = send_file(handle, mimetype="application/zip", as_attachment=True,
                              download_name=name, conditional=False)
         response.content_length = size
         response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Archive-Teachers"] = str(len(batch["payload"]))
+        response.headers["X-Archive-Teachers"] = str(len(resolved_payload))
         response.headers["X-Archive-Entries"] = str(num_files)
         response.call_on_close(handle.close)
         return response
