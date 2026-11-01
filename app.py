@@ -2,6 +2,9 @@
 import csv
 import hashlib
 import io
+import tempfile
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -929,12 +932,26 @@ def export_all():
 
 # V8: durable export history (same dedicated Supabase project, no other projects touched).
 # Run migration_v8.sql ONCE inside umm-school-archive-db before using this feature.
-def export_inventory(status="all", output_format="folders"):
-    """Classify each teacher by the VERSION ACTUALLY CONFIRMED as downloaded.
+def all_export_document_snapshots():
+    """Stable paging for the per-document table (up to 400 * 5 records)."""
+    rows = []
+    for offset in range(0, 10000, 500):
+        part = (table("export_document_history")
+                .select("teacher_id,output_format,kind,storage_path,version,exported_at")
+                .order("teacher_id").order("output_format").order("kind")
+                .range(offset, offset + 499).execute().data or [])
+        rows.extend(part)
+        if len(part) < 500:
+            break
+    return rows
 
-    Scanning a new document, changing its pages, deleting a document or
-    renaming a teacher changes its fingerprint and will label it UPDATED.
-    History is per output format because a folder ZIP differs from merged PDF.
+
+def export_inventory(status="all", output_format="folders"):
+    """Return teacher download state and newly added document kinds.
+
+    Previous teachers remain tied to the explicitly CONFIRMED download,
+    while per-kind history identifies documents added to an incomplete file
+    after the last confirmed folder export.
     """
     if status not in ("all", "complete", "incomplete") or output_format not in ("folders", "pdf"):
         raise UserError("فلتر أو نوع تصدير غير صحيح")
@@ -944,12 +961,13 @@ def export_inventory(status="all", output_format="folders"):
     for doc in documents:
         grouped.setdefault(doc["teacher_id"], {})[doc["kind"]] = doc
     try:
-        exported = table("export_history").select("teacher_id,output_format,fingerprint,exported_at").eq(
-            "output_format", output_format).execute().data or []
+        exported = all_records("export_history", "teacher_id,output_format,fingerprint,exported_at", "teacher_id")
+        per_doc = all_export_document_snapshots()
     except Exception:
-        app.logger.exception("Missing or inaccessible export history table")
-        raise UserError("جدول متابعة التصدير غير جاهز. نفّذ migration_v8.sql في مشروع الأرشفة الجديد فقط.", 503)
-    indexed = {row["teacher_id"]: row for row in exported}
+        app.logger.exception("Export history migration missing or inaccessible")
+        raise UserError("نفّذ migration_v9.sql في قاعدة أرشيف المدرسة فقط قبل استخدام التصدير.", 503)
+    indexed = {(r["teacher_id"], r["output_format"]): r for r in exported}
+    file_index = {(r["teacher_id"], r["output_format"], r["kind"]): r for r in per_doc}
     result, empty = [], 0
     for teacher in sorted(teachers, key=lambda t: t["full_name"]):
         td = grouped.get(teacher["id"], {})
@@ -960,19 +978,24 @@ def export_inventory(status="all", output_format="folders"):
             continue
         if not n:
             empty += 1
-            continue   # no empty ZIP folders and no false 'downloaded' marks
+            continue
         parts = [[k, int(td[k].get("version") or 1), td[k]["storage_path"]] for k in KINDS if k in td]
         raw = json.dumps([teacher["full_name"], teacher["national_id"], parts],
                          ensure_ascii=False, separators=(",", ":"))
         fingerprint = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        prev = indexed.get(teacher["id"])
-        kind = ("new" if not prev else
-                "previous" if prev["fingerprint"] == fingerprint else "updated")
+        prev = indexed.get((teacher["id"], output_format))
+        state = "new" if not prev else "previous" if prev["fingerprint"] == fingerprint else "updated"
+        added_kinds = ([kind for kind in KINDS if kind in td and
+                       (teacher["id"], output_format, kind) not in file_index]
+                       if prev else [])
         result.append({
             "id": teacher["id"], "name": teacher["full_name"], "document_count": n,
             "missing": [label for key, label in KINDS.items() if key not in td],
-            "fingerprint": fingerprint, "download_state": kind,
+            "fingerprint": fingerprint, "download_state": state,
+            "additions": added_kinds, "additions_count": len(added_kinds),
             "exported_at": prev.get("exported_at") if prev else None,
+            "files": [{"kind": k, "path": td[k]["storage_path"],
+                       "version": int(td[k].get("version") or 1)} for k in KINDS if k in td],
         })
     return result, empty
 
@@ -984,6 +1007,8 @@ def export_summary(items, empty=0):
         "previous": sum(x["download_state"] == "previous" for x in items),
         "empty": empty,
         "total": len(items),
+        "additions_teachers": sum(x["additions_count"] > 0 for x in items),
+        "additions_documents": sum(x["additions_count"] for x in items),
     }
 
 
@@ -994,7 +1019,7 @@ def preview_export():
     items, empty = export_inventory(request.args.get("status", "all"), output_format)
     # Do not expose fingerprint or full ID unnecessarily in an informational preview.
     return jsonify(summary=export_summary(items, empty),
-                   items=[{k: v for k, v in item.items() if k != "fingerprint"} for item in items])
+                   items=[{k: v for k, v in item.items() if k not in ("fingerprint", "files")} for item in items])
 
 
 @app.post("/api/export/prepare")
@@ -1003,32 +1028,47 @@ def prepare_export():
     args = request.get_json(silent=True) or {}
     status, fmt = args.get("status", "all"), args.get("format", "folders")
     selection = args.get("selection", "pending")
-    if selection not in ("pending", "all", "new", "updated", "previous"):
+    if selection not in ("pending", "all", "new", "updated", "previous", "additions"):
         raise UserError("اختيار التنزيل غير صحيح")
+    if selection == "additions" and fmt != "folders":
+        raise UserError("استكمال النواقص يُنزل المستندات المنفصلة داخل مجلد المعلم فقط")
     try:
         start = max(0, int(args.get("start", 0)))
-        count = max(1, min(400, int(args.get("count", 50))))
+        count = max(1, min(400, int(args.get("count", 20))))
     except (TypeError, ValueError):
         raise UserError("حدود الدفعة غير صحيحة")
-    items, empty = export_inventory(status, fmt)
+    items, _ = export_inventory(status, fmt)
     if selection == "pending":
         items = [i for i in items if i["download_state"] in ("new", "updated")]
+    elif selection == "additions":
+        items = [i for i in items if i["additions_count"]]
     elif selection != "all":
         items = [i for i in items if i["download_state"] == selection]
     chosen = items[start:start + count]
     if not chosen:
-        raise UserError("لا توجد ملفات جديدة في هذه الدفعة. اختر الكل إذا أردت تنزيل الملفات السابقة أيضًا.")
-    payload = [{"id": item["id"], "fingerprint": item["fingerprint"]} for item in chosen]
-    new_batch = {
-        "actor_id": request.current_user["id"], "output_format": fmt,
-        "payload": payload,
-    }
+        raise UserError("لا توجد ملفات لهذا الاختيار؛ جرّب الكل أو غيّر حالة الملفات.")
+    payload = []
+    for item in chosen:
+        # The exact PDF paths must be frozen at prepare time; never silently
+        # export newer files than the user confirmed.
+        files = ([f for f in item["files"] if f["kind"] in item["additions"]]
+                 if selection == "additions" else item["files"])
+        if not files:
+            raise UserError("هذه الدفعة لا تحتوي مستندات قابلة للتنزيل")
+        payload.append({"id": item["id"], "name": item["name"],
+                        "fingerprint": item["fingerprint"], "files": files,
+                        "complete_snapshot": selection != "additions",
+                        "selection": selection})
     try:
-        result = table("export_batches").insert(new_batch).execute().data[0]
+        saved = table("export_batches").insert({
+            "actor_id": request.current_user["id"], "output_format": fmt,
+            "payload": payload,
+        }).execute().data[0]
     except Exception:
         app.logger.exception("Could not prepare export batch")
-        raise UserError("تعذر تجهيز التصدير. تأكد من تشغيل migration_v8.sql داخل مشروع الأرشفة.", 503)
-    return jsonify(batch_id=result["id"], count=len(chosen),
+        raise UserError("تعذّر تجهيز التصدير؛ تأكد من تنفيذ migration_v9.sql.", 503)
+    return jsonify(batch_id=saved["id"], count=len(payload),
+                   document_count=sum(len(row["files"]) for row in payload),
                    summary=export_summary(chosen), names=[i["name"] for i in chosen[:10]])
 
 
@@ -1043,23 +1083,103 @@ def user_batch(batch_id):
     return batch
 
 
+def _build_complete_export(batch, teacher_lookup):
+    """Build and verify a ZIP BEFORE sending HTTP bytes.
+
+    The old streamed ZIP could stop mid-download when the free instance was
+    interrupted or one storage fetch failed; the browser then received a
+    partial ZIP while the UI still showed the expected teacher count.
+    """
+    payload = batch["payload"]
+    handle = tempfile.TemporaryFile(mode="w+b")  # ephemeral, deleted on close
+    MAX_ARCHIVE_BYTES = 350 * 1024 * 1024
+    num_files = 0
+    try:
+        manifest = io.StringIO()
+        csv_writer = csv.writer(manifest)
+        csv_writer.writerow(["اسم المعلم", "اسم المستند", "عدد المستندات في الدفعة"])
+        with zipfile.ZipFile(handle, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive, \
+                ThreadPoolExecutor(max_workers=4) as fetch_pool:
+            for row in payload:
+                teacher = teacher_lookup.get(row["id"])
+                if not teacher:
+                    raise UserError("أحد المعلمين في الدفعة لم يعد موجودًا؛ جهّز دفعة جديدة.", 409)
+                files = row.get("files") or []
+                if not files:
+                    raise UserError("أحد ملفات المعلمين فارغ؛ أعد تجهيز الدفعة.", 409)
+                label = f"{clean(teacher['full_name'])}_{clean(teacher['national_id'][-4:])}_{teacher['id'][:6]}"
+                # Fetch no more than five images for a teacher at once. This
+                # speeds up large batches without keeping every PDF in memory.
+                tasks = {f["kind"]: fetch_pool.submit(storage().download, f["path"]) for f in files}
+                if batch["output_format"] == "pdf":
+                    writer = PdfWriter()
+                    for item in files:
+                        blob = tasks[item["kind"]].result(timeout=90)
+                        if not blob.startswith(b"%PDF"):
+                            raise UserError(f"ملف PDF غير صالح للمعلم {teacher['full_name']}")
+                        writer.append(io.BytesIO(blob))
+                        csv_writer.writerow([teacher["full_name"], KINDS.get(item["kind"], item["kind"]), len(files)])
+                    merged = io.BytesIO()
+                    writer.write(merged)
+                    archive.writestr(f"{label}.pdf", merged.getvalue())
+                    num_files += 1
+                else:
+                    for item in files:
+                        blob = tasks[item["kind"]].result(timeout=90)
+                        if not blob.startswith(b"%PDF"):
+                            raise UserError(f"ملف PDF غير صالح للمعلم {teacher['full_name']}")
+                        entry = f"{label}/{clean(KINDS[item['kind']])}.pdf"
+                        archive.writestr(entry, blob)
+                        csv_writer.writerow([teacher["full_name"], KINDS[item["kind"]], len(files)])
+                        num_files += 1
+                if handle.tell() > MAX_ARCHIVE_BYTES:
+                    raise UserError("ملف ZIP أكبر من الحد الآمن للجهاز؛ قلّل عدد المعلمين في الدفعة إلى 10 أو 20.", 413)
+            archive.writestr("قائمة_الملفات.csv", "\ufeff" + manifest.getvalue())
+            num_files += 1
+        handle.flush()
+        size = handle.tell()
+        handle.seek(0)
+        with zipfile.ZipFile(handle, "r") as check:
+            names = check.namelist()
+            if len(names) != num_files or check.testzip() is not None:
+                raise UserError("فشل التحقق من اكتمال ZIP؛ لم يتم إرسال الملف أو تسجيل تنزيله.", 503)
+        handle.seek(0)
+        return handle, size, num_files
+    except Exception:
+        handle.close()
+        raise
+
+
 @app.get("/api/export/batch/<batch_id>.zip")
 @login_required(roles=("admin",))
 def get_export_batch(batch_id):
     batch = user_batch(batch_id)
-    ids = {row["id"] for row in batch["payload"]}
-    all_teachers = all_records("teachers", "id,full_name,national_id,position")
-    grouped = {t["id"]: t for t in all_teachers}
-    chosen = [grouped[row["id"]] for row in batch["payload"] if row["id"] in grouped]
-    if not chosen:
-        raise UserError("لم تعد هذه الدفعة تحتوي على ملفات", 404)
-    name = "school_archive_" + datetime.now(timezone.utc).strftime("%Y%m%d") + ".zip"
-    return Response(stream_with_context(archive_stream(chosen, batch["output_format"])),
-                    mimetype="application/zip", headers={
-                        "Content-Disposition": f"attachment; filename={name}",
-                        "Cache-Control": "no-store",
-                        "X-Content-Type-Options": "nosniff",
-                    })
+    lookup = {t["id"]: t for t in all_records("teachers", "id,full_name,national_id,position")}
+    try:
+        handle, size, num_files = _build_complete_export(batch, lookup)
+    except UserError:
+        raise
+    except Exception:
+        app.logger.exception("ZIP creation failed before response")
+        raise UserError("تعذّر تنزيل بعض ملفات PDF من التخزين. لم نرسل ZIP ناقصًا؛ جرّب دفعة أصغر.", 503)
+    try:
+        table("export_batches").update({
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "built_bytes": size, "built_entries": num_files,
+        }).eq("id", batch["id"]).execute()
+        name = (f"school_archive_{len(batch['payload'])}_teachers_"
+                f"{datetime.now(timezone.utc).strftime('%Y%m%d')}_{batch['id'][:8]}.zip")
+        response = send_file(handle, mimetype="application/zip", as_attachment=True,
+                             download_name=name, conditional=False)
+        response.content_length = size
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Archive-Teachers"] = str(len(batch["payload"]))
+        response.headers["X-Archive-Entries"] = str(num_files)
+        response.call_on_close(handle.close)
+        return response
+    except Exception:
+        handle.close()
+        raise
 
 
 @app.post("/api/export/confirm")
@@ -1069,27 +1189,64 @@ def confirm_export():
     batch = user_batch(args.get("batch_id"))
     if batch.get("confirmed_at"):
         return jsonify(ok=True, count=0, already_confirmed=True)
+    if not batch.get("built_at") or not batch.get("built_bytes"):
+        raise UserError("لم يكتمل تجهيز ZIP؛ لا يمكن تسجيل تنزيله.", 409)
     stamp = datetime.now(timezone.utc).isoformat()
-    # Only confirm the snapshot on the server. Changes made during download
-    # remain labelled 'updated' at the next export instead of being lost.
-    rows = [{
-        "teacher_id": row["id"], "output_format": batch["output_format"],
-        "fingerprint": row["fingerprint"], "exported_at": stamp,
-        "exported_by": request.current_user["id"],
-    } for row in batch["payload"]]
-    if not rows:
-        raise UserError("دفعة فارغة")
-    # If another phone confirmed a NEWER download, avoid overwriting that
-    # history with an older export batch.
+    ids = [r["id"] for r in batch["payload"]]
     existing = table("export_history").select("teacher_id,exported_at").eq(
-        "output_format", batch["output_format"]).in_(
-        "teacher_id", [r["teacher_id"] for r in rows]).execute().data or []
-    newer = {row["teacher_id"] for row in existing if row["exported_at"] and
-             datetime.fromisoformat(row["exported_at"].replace("Z", "+00:00")) >
+        "output_format", batch["output_format"]).in_("teacher_id", ids).execute().data or []
+    newer = {r["teacher_id"] for r in existing if r.get("exported_at") and
+             datetime.fromisoformat(r["exported_at"].replace("Z", "+00:00")) >
              datetime.fromisoformat(batch["created_at"].replace("Z", "+00:00"))}
-    rows = [r for r in rows if r["teacher_id"] not in newer]
-    if rows:
-        table("export_history").upsert(rows, on_conflict="teacher_id,output_format").execute()
+    safe = [r for r in batch["payload"] if r["id"] not in newer]
+    # Keep histories of individual PDFs so 'added missing documents' can
+    # download ONLY kinds not included in a previous confirmed export.
+    detail_rows = [{"teacher_id": r["id"], "output_format": batch["output_format"],
+                    "kind": f["kind"], "storage_path": f["path"],
+                    "version": f["version"], "exported_at": stamp}
+                   for r in safe for f in r.get("files", [])]
+    if detail_rows:
+        for start in range(0, len(detail_rows), 200):
+            table("export_document_history").upsert(
+                detail_rows[start:start+200],
+                on_conflict="teacher_id,output_format,kind").execute()
+    full_rows = [{"teacher_id": r["id"], "output_format": batch["output_format"],
+                  "fingerprint": r["fingerprint"], "exported_at": stamp,
+                  "exported_by": request.current_user["id"]}
+                 for r in safe if r.get("complete_snapshot", True)]
+    if full_rows:
+        table("export_history").upsert(full_rows,
+                                       on_conflict="teacher_id,output_format").execute()
+    # For additions-only, update the overall status ONLY when all present
+    # documents (including old ones) are actually covered by confirmed versions.
+    partial = [r for r in safe if not r.get("complete_snapshot", True)]
+    if partial:
+        documents = all_records("documents", "teacher_id,kind,storage_path,version")
+        grouped = {}
+        for d in documents:
+            grouped.setdefault(d["teacher_id"], {})[d["kind"]] = d
+        recent_history = all_export_document_snapshots()
+        known = {(r["teacher_id"], r["output_format"], r["kind"]): r for r in recent_history}
+        reconciled = []
+        for item in partial:
+            current = grouped.get(item["id"], {})
+            if current and all((item["id"], batch["output_format"], k) in known and
+                known[(item["id"], batch["output_format"], k)]["storage_path"] == doc["storage_path"]
+                and int(known[(item["id"], batch["output_format"], k)]["version"]) == int(doc["version"])
+                for k, doc in current.items()):
+                # Recompute fingerprint from the CURRENT teacher info, not the
+                # old prepared batch, so another user edit stays 'updated'.
+                teacher = teacher_by_id(item["id"])
+                parts = [[k, int(current[k]["version"]), current[k]["storage_path"]] for k in KINDS if k in current]
+                raw = json.dumps([teacher["full_name"], teacher["national_id"], parts],
+                                 ensure_ascii=False, separators=(",", ":"))
+                reconciled.append({"teacher_id": item["id"],
+                    "output_format": batch["output_format"],
+                    "fingerprint": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                    "exported_at": stamp, "exported_by": request.current_user["id"]})
+        if reconciled:
+            table("export_history").upsert(reconciled,
+                                           on_conflict="teacher_id,output_format").execute()
     table("export_batches").update({"confirmed_at": stamp}).eq("id", batch["id"]).is_("confirmed_at", "null").execute()
     audit("تأكيد تنزيل الأرشيف", f"{len(batch['payload'])} معلم • الصيغة: {batch['output_format']}")
     return jsonify(ok=True, count=len(batch["payload"]))
@@ -1115,9 +1272,34 @@ def mark_exports_before_upgrade():
         "exported_at": stamp, "exported_by": request.current_user["id"],
     } for teacher_id in ids]
     table("export_history").upsert(rows, on_conflict="teacher_id,output_format").execute()
+    snapshots = [{"teacher_id": teacher_id, "output_format": fmt,
+                  "kind": doc["kind"], "storage_path": doc["path"],
+                  "version": doc["version"], "exported_at": stamp}
+                 for teacher_id in ids for doc in indexed[teacher_id]["files"]]
+    if snapshots:
+        for start in range(0, len(snapshots), 200):
+            table("export_document_history").upsert(
+                snapshots[start:start+200], on_conflict="teacher_id,output_format,kind").execute()
     audit("تسجيل ملفات نُزّلت سابقًا", f"{len(ids)} معلم • الصيغة: {fmt}")
     return jsonify(ok=True, count=len(ids))
 
+
+
+@app.post("/api/export/reset")
+@login_required(roles=("admin",))
+def reset_export_for_missing_phone_files():
+    """Undo mistakenly marked teacher downloads; NEVER delete archived PDFs."""
+    data = request.get_json(silent=True) or {}
+    fmt, teacher_ids = data.get("format", "folders"), data.get("teacher_ids", [])
+    if fmt not in ("folders", "pdf") or not isinstance(teacher_ids, list) or not 1 <= len(teacher_ids) <= 400:
+        raise UserError("صيغة التنزيل أو قائمة المعلمين غير صحيحة")
+    normalized = [uid(identifier) for identifier in teacher_ids]
+    if len(set(normalized)) != len(normalized):
+        raise UserError("قائمة المعلمين فيها تكرار")
+    table("export_history").delete().eq("output_format", fmt).in_("teacher_id", normalized).execute()
+    table("export_document_history").delete().eq("output_format", fmt).in_("teacher_id", normalized).execute()
+    audit("إعادة تصنيف تنزيلات لم تصل للهاتف", f"{len(normalized)} معلم • النوع: {fmt}")
+    return jsonify(ok=True, count=len(normalized))
 
 
 # V8 notification center: audit data + account-level read pointer, no public document URLs.
