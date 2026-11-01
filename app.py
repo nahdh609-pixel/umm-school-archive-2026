@@ -1083,6 +1083,36 @@ def user_batch(batch_id):
     return batch
 
 
+def _export_pdf_with_retries(item, teacher_name):
+    """Retry transient storage failures; report the exact teacher/document.
+
+    Do not substitute an empty PDF, silently skip a document, or mutate its
+    storage path. This is solely for the privileged admin ZIP operation.
+    """
+    kind = item.get("kind")
+    label = KINDS.get(kind, str(kind or "مستند"))
+    path = item.get("path")
+    if not path:
+        raise UserError(f"مسار مستند {label} للمعلم {teacher_name} غير موجود؛ راجع ملف المعلم.", 409)
+    for attempt in range(4):
+        try:
+            blob = storage().download(path)
+            if not isinstance(blob, bytes) or not blob.startswith(b"%PDF"):
+                raise UserError(f"ملف {label} للمعلم {teacher_name} غير صالح كملف PDF. افحصه في أرشيف المعلم.", 422)
+            return blob
+        except UserError:
+            raise
+        except Exception as exc:
+            app.logger.warning("Archive PDF download failed; kind=%s attempt=%s/4", kind, attempt + 1,
+                               exc_info=attempt == 3)
+            if attempt == 3:
+                raise UserError(
+                    f"تعذّر تنزيل {label} للمعلم {teacher_name} بعد أربع محاولات. "
+                    "افتح PDF الخاص به وتأكد من وجوده في التخزين ثم أعد التنزيل. "
+                    "لم يُنشأ ZIP ناقص.", 503) from exc
+            time.sleep((0.6, 1.2, 2.0)[attempt])
+
+
 def _build_complete_export(batch, teacher_lookup):
     """Build and verify a ZIP BEFORE sending HTTP bytes.
 
@@ -1099,7 +1129,7 @@ def _build_complete_export(batch, teacher_lookup):
         csv_writer = csv.writer(manifest)
         csv_writer.writerow(["اسم المعلم", "اسم المستند", "عدد المستندات في الدفعة"])
         with zipfile.ZipFile(handle, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive, \
-                ThreadPoolExecutor(max_workers=4) as fetch_pool:
+                ThreadPoolExecutor(max_workers=3) as fetch_pool:
             for row in payload:
                 teacher = teacher_lookup.get(row["id"])
                 if not teacher:
@@ -1110,11 +1140,11 @@ def _build_complete_export(batch, teacher_lookup):
                 label = f"{clean(teacher['full_name'])}_{clean(teacher['national_id'][-4:])}_{teacher['id'][:6]}"
                 # Fetch no more than five images for a teacher at once. This
                 # speeds up large batches without keeping every PDF in memory.
-                tasks = {f["kind"]: fetch_pool.submit(storage().download, f["path"]) for f in files}
+                tasks = {f["kind"]: fetch_pool.submit(_export_pdf_with_retries, f, teacher["full_name"]) for f in files}
                 if batch["output_format"] == "pdf":
                     writer = PdfWriter()
                     for item in files:
-                        blob = tasks[item["kind"]].result(timeout=90)
+                        blob = tasks[item["kind"]].result(timeout=115)
                         if not blob.startswith(b"%PDF"):
                             raise UserError(f"ملف PDF غير صالح للمعلم {teacher['full_name']}")
                         writer.append(io.BytesIO(blob))
@@ -1125,7 +1155,7 @@ def _build_complete_export(batch, teacher_lookup):
                     num_files += 1
                 else:
                     for item in files:
-                        blob = tasks[item["kind"]].result(timeout=90)
+                        blob = tasks[item["kind"]].result(timeout=115)
                         if not blob.startswith(b"%PDF"):
                             raise UserError(f"ملف PDF غير صالح للمعلم {teacher['full_name']}")
                         entry = f"{label}/{clean(KINDS[item['kind']])}.pdf"
@@ -1161,7 +1191,7 @@ def get_export_batch(batch_id):
         raise
     except Exception:
         app.logger.exception("ZIP creation failed before response")
-        raise UserError("تعذّر تنزيل بعض ملفات PDF من التخزين. لم نرسل ZIP ناقصًا؛ جرّب دفعة أصغر.", 503)
+        raise UserError("تعذّر إنشاء ZIP بسبب خطأ في الاتصال أو التخزين؛ لم نرسل ملفًا ناقصًا. راجع سجل Render إذا تكرر.", 503)
     try:
         table("export_batches").update({
             "built_at": datetime.now(timezone.utc).isoformat(),
