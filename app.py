@@ -1110,6 +1110,12 @@ def prepare_export():
     args = request.get_json(silent=True) or {}
     status, fmt = args.get("status", "all"), args.get("format", "folders")
     selection = args.get("selection", "pending")
+    # Same export tables: layout/name are kept in existing JSON payload, no schema change.
+    layout = "flat" if fmt == "folders" else "legacy"
+    batch_name = str(args.get("batch_name", "الدفعة الأولى")).strip()
+    if not batch_name or len(batch_name) > 70:
+        raise UserError("اكتب اسم الدفعة (من 1 إلى 70 حرفًا).")
+    batch_name = clean(batch_name, 70)
     if selection not in ("pending", "all", "new", "updated", "previous", "additions"):
         raise UserError("اختيار التنزيل غير صحيح")
     if selection == "additions" and fmt != "folders":
@@ -1140,7 +1146,8 @@ def prepare_export():
         payload.append({"id": item["id"], "name": item["name"],
                         "fingerprint": item["fingerprint"], "files": files,
                         "complete_snapshot": selection != "additions",
-                        "selection": selection})
+                        "selection": selection, "layout": layout,
+                        "batch_name": batch_name})
     try:
         saved = table("export_batches").insert({
             "actor_id": request.current_user["id"], "output_format": fmt,
@@ -1150,6 +1157,7 @@ def prepare_export():
         app.logger.exception("Could not prepare export batch")
         raise UserError("تعذّر تجهيز التصدير؛ تأكد من تنفيذ migration_v9.sql.", 503)
     return jsonify(batch_id=saved["id"], count=len(payload),
+                   layout=layout, batch_name=batch_name,
                    document_count=sum(len(row["files"]) for row in payload),
                    summary=export_summary(chosen), names=[i["name"] for i in chosen[:10]])
 
@@ -1474,13 +1482,277 @@ def repair_archive_links():
                    healthy=ok, repaired=repaired, issues=issues)
 
 
+def _build_available_export(batch, teacher_lookup):
+    """Read-only emergency export: real reachable PDFs plus explicit missing report.
+
+    IMPORTANT: Does not modify archive_documents, storage or download history.
+    It is deliberately not treated as a full/confirmed export.
+    """
+    handle = tempfile.TemporaryFile(mode="w+b")
+    max_size = 350 * 1024 * 1024
+    expected_folders = len(batch["payload"])
+    pdf_count = 0
+    missing = []
+    try:
+        current_rows = all_records("documents", "teacher_id,kind,storage_path,version,pages", "created_at")
+        latest = {(d["teacher_id"], d["kind"]): d for d in current_rows}
+        list_csv = io.StringIO()
+        writer = csv.writer(list_csv)
+        writer.writerow(["اسم المعلم", "المستند", "الحالة", "عدد الصفحات"])
+        with zipfile.ZipFile(handle, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            for row in batch["payload"]:
+                teacher = teacher_lookup.get(row["id"])
+                if not teacher:
+                    raise UserError("تعذر العثور على معلم في دفعة التصدير. لم يجرِ أي حذف.", 409)
+                folder = f"{clean(teacher['full_name'])}_{clean(teacher['national_id'][-4:])}_{teacher['id'][:6]}/"
+                # Keep one folder per selected teacher even when one or more PDFs are missing.
+                archive.writestr(folder, b"")
+                teacher_missing = []
+                for wanted in row.get("files") or []:
+                    kind = wanted.get("kind")
+                    title = KINDS.get(kind, "مستند غير معروف")
+                    current = latest.get((row["id"], kind))
+                    if current is None:
+                        err = "لا يوجد مستند مسجل حاليًا"
+                    else:
+                        try:
+                            blob, resolved = _export_pdf_with_retries({
+                                "kind": kind, "path": current["storage_path"],
+                                "version": int(current.get("version") or 1),
+                                "pages": int(current.get("pages") or 0),
+                            }, teacher["full_name"], row["id"])
+                            actual_pages = len(PdfReader(io.BytesIO(blob), strict=False).pages)
+                            if actual_pages < 1 or (current.get("pages") and
+                                actual_pages != int(current["pages"])):
+                                raise UserError("عدد صفحات PDF لا يطابق السجل؛ يحتاج مراجعة", 409)
+                            archive.writestr(folder + clean(title) + ".pdf", blob)
+                            pdf_count += 1
+                            writer.writerow([teacher["full_name"], title, "سليم - موجود في ZIP", actual_pages])
+                            if handle.tell() > max_size:
+                                raise UserError("حجم ZIP تجاوز 350 ميغابايت؛ صدّر دفعة أصغر.", 413)
+                            continue
+                        except UserError as exc:
+                            # Do not swallow fatal size limits, permissions, or configuration faults.
+                            if exc.code in (401,403,413):
+                                raise
+                            err = exc.message
+                        except Exception as exc:
+                            app.logger.exception("Available-only PDF check failed: teacher=%s kind=%s", row["id"], kind)
+                            err = "فشل فحص PDF؛ لم يُضف إلى الأرشيف"
+                    teacher_missing.append(title)
+                    missing.append((teacher["full_name"], title, err))
+                    writer.writerow([teacher["full_name"], title, "غير متاح - يحتاج استرجاع", ""])
+                if teacher_missing:
+                    message = ("تنبيه: هذه نسخة طوارئ للمستندات القابلة للقراءة فقط.\n"
+                               "المستندات التالية لم تُضمّن لأنها غير متاحة في التخزين:\n- " +
+                               "\n- ".join(teacher_missing) +
+                               "\nلم يُحذف أي شيء من المنظومة. هذه ليست نسخة كاملة من الملف.\n")
+                    archive.writestr(folder + "تنبيه_مستندات_غير_متاحة.txt", message.encode("utf-8-sig"))
+            missing_csv = io.StringIO()
+            m = csv.writer(missing_csv)
+            m.writerow(["المعلم", "المستند غير المتاح", "السبب"])
+            m.writerows(missing)
+            archive.writestr("قائمة_الملفات.csv", ("\ufeff" + list_csv.getvalue()).encode("utf-8"))
+            archive.writestr("ملفات_غير_متاحة.csv", ("\ufeff" + missing_csv.getvalue()).encode("utf-8"))
+            archive.writestr("اقرأني_قبل_الاعتماد.txt", (
+                "هذه نسخة للملفات السليمة والمتاحة فقط.\n"
+                f"المعلمون في الدفعة: {expected_folders}\n"
+                f"ملفات PDF التي تم تضمينها: {pdf_count}\n"
+                f"المستندات غير المتاحة: {len(missing)}\n"
+                "راجع ملفات_غير_متاحة.csv. لا تُعتبر هذه الدفعة تنزيلاً كاملاً ولن تُسجّل كتأكيد تنزيل.\n"
+                "لم يتم حذف أو تعديل أي اسم أو مستند أو ملف في Supabase.\n").encode("utf-8-sig"))
+        if not pdf_count:
+            raise UserError("لم نجد أي PDF قابل للتنزيل في هذه الدفعة؛ لم نغيّر الأرشيف.", 503)
+        handle.flush()
+        size = handle.tell()
+        handle.seek(0)
+        with zipfile.ZipFile(handle, "r") as check:
+            entries = check.namelist()
+            actual_pdf = sum(n.lower().endswith('.pdf') for n in entries)
+            folders = sum(n.endswith('/') for n in entries)
+            if (folders != expected_folders or actual_pdf != pdf_count
+                    or check.testzip() is not None):
+                raise UserError("فشل فحص ZIP للملفات السليمة؛ لم يُرسل ملف ناقص دون بيان.", 503)
+            entry_count = len(entries)
+        handle.seek(0)
+        return handle, size, entry_count, pdf_count, len(missing), expected_folders
+    except Exception:
+        handle.close()
+        raise
+
+
+
+# V9.5 — Export-only presentation. Never mutate teachers, documents or Storage.
+def _flat_batch_name(batch):
+    payload = batch.get("payload") or []
+    label = str((payload[0].get("batch_name") if payload else "") or "الدفعة").strip()
+    return clean(label, 70)
+
+
+def _flat_export_filename(teacher, kind, used_names):
+    """Keep names human-readable; disambiguate same-name teachers safely."""
+    label = KINDS.get(kind, kind)
+    stem = clean(f"{teacher['full_name']} - {label}", 150)
+    filename = stem + ".pdf"
+    if filename.casefold() in used_names:
+        suffix = clean(str(teacher.get("national_id", ""))[-4:] + "_" + teacher["id"][:8], 22)
+        filename = clean(stem, 125) + "_" + suffix + ".pdf"
+    used_names.add(filename.casefold())
+    return filename
+
+
+def _build_flat_export(batch, teacher_lookup, available_only=False):
+    """Single named directory with directly named PDFs and audit reports.
+
+    Partial mode never updates the confirmed export history. Complete mode is
+    all-or-nothing and returns resolved snapshots for later explicit confirmation.
+    """
+    payload = batch.get("payload") or []
+    if not payload or batch.get("output_format") != "folders":
+        raise UserError("تنسيق الدفعة غير صالح، أعد تجهيزها.", 400)
+    temp = tempfile.TemporaryFile(mode="w+b")
+    max_size = 350 * 1024 * 1024
+    used_names, good, bad, resolved_payload = set(), [], [], []
+    label = _flat_batch_name(batch)
+    prefix = label + "/"
+    try:
+        all_docs = all_records("documents", "teacher_id,kind,storage_path,version,pages", "created_at")
+        current = {(d["teacher_id"], d["kind"]): d for d in all_docs}
+        with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+            archive.writestr(prefix, b"")
+            for row in payload:
+                teacher = teacher_lookup.get(row["id"])
+                if not teacher:
+                    raise UserError("أحد المعلمين لم يعد موجودًا؛ لم يتم تعديل أي بيانات.", 409)
+                chosen = row.get("files") or []
+                if not chosen:
+                    raise UserError(f"لا توجد مستندات في دفعة المعلم {teacher['full_name']}.", 409)
+                success = []
+                for item in chosen:
+                    kind = item.get("kind")
+                    title = KINDS.get(kind, str(kind or "مستند"))
+                    fresh = current.get((row["id"], kind))
+                    if not fresh:
+                        error = "المستند غير مسجل حاليًا"
+                        if not available_only:
+                            raise UserError(f"{title} للمعلم {teacher['full_name']}: {error}.", 409)
+                        bad.append([teacher["full_name"], title, error])
+                        continue
+                    snapshot = {"kind": kind, "path": fresh["storage_path"],
+                                "version": int(fresh.get("version") or 1),
+                                "pages": int(fresh.get("pages") or 0)}
+                    try:
+                        blob, resolved = _export_pdf_with_retries(snapshot, teacher["full_name"], row["id"])
+                        pdf = PdfReader(io.BytesIO(blob), strict=False)
+                        pages = len(pdf.pages)
+                        if pages < 1 or (snapshot["pages"] and pages != snapshot["pages"]):
+                            raise UserError("نسخة PDF لا تطابق عدد الصفحات المسجل؛ تحتاج مراجعة.", 409)
+                    except UserError as exc:
+                        if not available_only or exc.code in (401, 403, 413):
+                            raise
+                        bad.append([teacher["full_name"], title, exc.message])
+                        continue
+                    except Exception:
+                        app.logger.exception("Flat export could not read pdf: teacher=%s kind=%s", row["id"], kind)
+                        if not available_only:
+                            raise UserError(f"تعذر التحقق من {title} للمعلم {teacher['full_name']}؛ لم تُرسل الدفعة ناقصة.", 503)
+                        bad.append([teacher["full_name"], title, "تعذر فتح PDF أو فحصه"])
+                        continue
+                    filename = _flat_export_filename(teacher, kind, used_names)
+                    archive.writestr(prefix + filename, blob)
+                    good.append([teacher["full_name"], title, filename, pages])
+                    success.append(resolved)
+                    if temp.tell() > max_size:
+                        raise UserError("حجم الدفعة تجاوز 350 ميغابايت. نزّل دفعات أصغر حفاظًا على سرعة الهاتف.", 413)
+                if not available_only:
+                    # Keep the full teacher fingerprint when all kinds were included.
+                    # For additions only, confirmation stores per-document versions.
+                    if len(success) != len(chosen):
+                        raise UserError("لم تكتمل مستندات الدفعة. لم نؤكد تنزيل أي ملف.", 503)
+                    parts = [[k, f["version"], f["path"]] for k in KINDS for f in success if f["kind"] == k]
+                    raw = json.dumps([teacher["full_name"], teacher["national_id"], parts],
+                                     ensure_ascii=False, separators=(",", ":"))
+                    resolved_payload.append({**row, "files": success,
+                        "fingerprint": hashlib.sha256(raw.encode("utf-8")).hexdigest()})
+            manifest = io.StringIO()
+            csvw = csv.writer(manifest)
+            csvw.writerow(["اسم المعلم", "المستند", "اسم PDF في المجلد", "عدد الصفحات"])
+            csvw.writerows(good)
+            archive.writestr(prefix + "كشف_الملفات.csv", ("\ufeff" + manifest.getvalue()).encode("utf-8"))
+            missing = io.StringIO()
+            mc = csv.writer(missing)
+            mc.writerow(["اسم المعلم", "المستند غير المتاح", "السبب"])
+            mc.writerows(bad)
+            archive.writestr(prefix + "ملفات_تحتاج_استرجاع.csv", ("\ufeff" + missing.getvalue()).encode("utf-8"))
+            note = (f"اسم الدفعة: {label}\n"
+                    f"عدد ملفات PDF الموجودة فعليًا: {len(good)}\n"
+                    f"عدد المستندات المتعذرة: {len(bad)}\n"
+                    "لا يتم حذف أو تعديل أي ملفات في Supabase أثناء التصدير.\n"
+                    "إذا كان هناك مستند غير متاح، لا تعتبر هذا تنزيلًا كاملًا.\n")
+            archive.writestr(prefix + "معلومات_الدفعة.txt", note.encode("utf-8-sig"))
+        if not good:
+            raise UserError("لا توجد مستندات PDF سليمة متاحة لهذه الدفعة حاليًا.", 503)
+        temp.flush()
+        size = temp.tell()
+        temp.seek(0)
+        with zipfile.ZipFile(temp, "r") as verify:
+            names = verify.namelist()
+            pdf_names = [x for x in names if x.casefold().endswith(".pdf")]
+            expected = sum(len(row.get("files") or []) for row in payload)
+            if (len(pdf_names) != len(good) or len(pdf_names) != len(set(pdf_names))
+                    or (not available_only and (bad or len(good) != expected))
+                    or any(not x.startswith(prefix) for x in names)
+                    or sum(x.endswith("/") for x in names) != 1 or verify.testzip() is not None):
+                raise UserError("فشل تدقيق ZIP قبل الإرسال؛ لم تُسجَّل الدفعة على أنها كاملة.", 503)
+            entry_count = len(names)
+        temp.seek(0)
+        if available_only:
+            return temp, size, entry_count, len(good), len(bad), len(payload)
+        return temp, size, entry_count, resolved_payload
+    except Exception:
+        temp.close()
+        raise
+
+
+@app.get("/api/export/batch/<batch_id>/available.zip")
+@login_required(roles=("admin",))
+def get_available_export_batch(batch_id):
+    """Download reachable PDFs now; deliberately never updates confirmed history."""
+    batch = user_batch(batch_id)
+    teachers_lookup = {t["id"]: t for t in all_records("teachers", "id,full_name,national_id,position")}
+    flat = batch.get("output_format") == "folders" and any(
+        row.get("layout") == "flat" for row in batch.get("payload") or [])
+    handle, size, entries, pdfs, missing, folders = (
+        _build_flat_export(batch, teachers_lookup, available_only=True)
+        if flat else _build_available_export(batch, teachers_lookup))
+    label = clean((batch.get("payload") or [{}])[0].get("batch_name") or "دفعة", 40)
+    filename = (f"{label}_available_{pdfs}_pdf_"
+                f"{missing}_missing_{batch['id'][:8]}.zip")
+    response = send_file(handle, mimetype="application/zip", as_attachment=True,
+                         download_name=filename, conditional=False)
+    response.content_length = size
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Archive-Teachers"] = str(folders)
+    response.headers["X-Archive-Pdfs"] = str(pdfs)
+    response.headers["X-Archive-Missing"] = str(missing)
+    response.headers["X-Archive-Entries"] = str(entries)
+    response.call_on_close(handle.close)
+    return response
+
+
 @app.get("/api/export/batch/<batch_id>.zip")
 @login_required(roles=("admin",))
 def get_export_batch(batch_id):
     batch = user_batch(batch_id)
     lookup = {t["id"]: t for t in all_records("teachers", "id,full_name,national_id,position")}
     try:
-        handle, size, num_files, resolved_payload = _build_complete_export(batch, lookup)
+        flat = batch.get("output_format") == "folders" and any(
+            row.get("layout") == "flat" for row in batch.get("payload") or [])
+        if flat:
+            handle, size, num_files, resolved_payload = _build_flat_export(
+                batch, lookup, available_only=False)
+        else:
+            handle, size, num_files, resolved_payload = _build_complete_export(batch, lookup)
     except UserError:
         raise
     except Exception:
@@ -1492,13 +1764,17 @@ def get_export_batch(batch_id):
             "built_bytes": size, "built_entries": num_files,
             "payload": resolved_payload,
         }).eq("id", batch["id"]).execute()
-        name = (f"school_archive_{len(resolved_payload)}_teachers_"
+        batch_label = clean((resolved_payload or [{}])[0].get("batch_name") or "دفعة", 45)
+        name = (f"{batch_label}_{sum(len(r.get('files') or []) for r in resolved_payload)}_pdf_"
                 f"{datetime.now(timezone.utc).strftime('%Y%m%d')}_{batch['id'][:8]}.zip")
         response = send_file(handle, mimetype="application/zip", as_attachment=True,
                              download_name=name, conditional=False)
         response.content_length = size
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Archive-Teachers"] = str(len(resolved_payload))
+        response.headers["X-Archive-Pdfs"] = str(
+            len(resolved_payload) if batch["output_format"] == "pdf" else
+            sum(len(r.get("files") or []) for r in resolved_payload))
         response.headers["X-Archive-Entries"] = str(num_files)
         response.call_on_close(handle.close)
         return response
