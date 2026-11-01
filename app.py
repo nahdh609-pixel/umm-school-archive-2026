@@ -3,6 +3,8 @@ import csv
 import hashlib
 import io
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 import zipfile
 from urllib.parse import quote
@@ -223,13 +225,13 @@ def home():
 
 @app.get("/health")
 def health():
-    return jsonify(ok=True, version="V10-DARK-20261101")
+    return jsonify(ok=True, version="V13-THREE-ZIP-ONE-PDF-20261101")
 
 
 @app.get("/api/version")
 def public_version():
     """Deployment health indicator only; never expose customer records or keys."""
-    return jsonify(version="V10-DARK-20261101", theme="dark", download="native-zip")
+    return jsonify(version="V13-THREE-ZIP-ONE-PDF-20261101", theme="dark", download="three-zip-or-one-pdf")
 
 
 @app.post("/api/login")
@@ -1739,6 +1741,598 @@ def _build_flat_export(batch, teacher_lookup, available_only=False):
         raise
 
 
+
+
+
+
+# V13 — two non-destructive export choices (no SQL migration).
+# Option A: three independent ZIP batches, balanced by PDF DOCUMENT count.
+# Option B: a single searchable PDF with bookmarks by teacher/document.
+# All builds read source Storage; only explicit confirmation updates export history.
+
+def v13_balanced_chunks(items, parts=3):
+    """Deterministic, ordered, near-equal groups; 20 -> 7,7,6."""
+    size = len(items)
+    return [items[i * (size // parts) + min(i, size % parts):
+                  (i + 1) * (size // parts) + min(i + 1, size % parts)]
+            for i in range(parts)]
+
+
+def v13_chosen_documents(status, selection):
+    if selection not in ("all", "pending", "additions"):
+        raise UserError("اختيار المستندات غير صحيح", 400)
+    inventory, _ = export_inventory(status, "folders")
+    chosen = []
+    for item in inventory:
+        allowed = (set(item["additions"]) if selection == "additions" else
+                   set(item["pending_kinds"]) if selection == "pending" else
+                   {f["kind"] for f in item["files"]})
+        for f in item["files"]:
+            if f["kind"] in allowed:
+                chosen.append((item, f))
+    return chosen
+
+
+def v13_payload_from_documents(documents, batch_name, export_mode="triple_zip"):
+    """Keep each source PDF exactly once in the original teacher order."""
+    rows, indexed = [], {}
+    for teacher, doc in documents:
+        ident = teacher["id"]
+        if ident not in indexed:
+            item = {
+                "id": ident,
+                "name": teacher["name"],
+                "fingerprint": teacher["fingerprint"],
+                "complete_snapshot": False,
+                "files": [],
+                "selection": "v13",
+                "v13_mode": export_mode,
+                "layout": "flat",
+                "batch_name": batch_name,
+            }
+            indexed[ident] = item
+            rows.append(item)
+        indexed[ident]["files"].append({
+            "kind": doc["kind"],
+            "path": doc["path"],
+            "version": int(doc.get("version") or 1),
+        })
+    return rows
+
+
+@app.post("/api/export/v13/prepare")
+@login_required(roles=("admin",))
+def v13_prepare_export():
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "triple_zip")
+    if mode not in ("one_zip", "triple_zip", "single_pdf"):
+        raise UserError("اختر طريقة التنزيل الصحيحة", 400)
+    status = data.get("status", "all")
+    selection = data.get("selection", "all")
+    batch_name = clean(str(data.get("batch_name") or "الدفعة الأولى"), 50)
+    if not batch_name or len(batch_name) > 50:
+        raise UserError("اسم الدفعة غير صحيح", 400)
+    documents = v13_chosen_documents(status, selection)
+    if not documents:
+        raise UserError("لا توجد مستندات لهذا الاختيار. جرّب «كل الملفات».", 409)
+    if len(documents) > 5000:
+        raise UserError("عدد الملفات كبير جدًا لهذه العملية؛ راجع المسؤول.", 413)
+    split = v13_balanced_chunks(documents) if mode == "triple_zip" else [documents]
+    prepared = []
+    for i, group in enumerate(split):
+        if not group:
+            prepared.append({"part": i + 1, "batch_id": None,
+                             "pdf_count": 0, "teachers": 0})
+            continue
+        label = f"{batch_name} - الجزء {i+1}" if mode == "triple_zip" else batch_name
+        payload = v13_payload_from_documents(group, label, mode)
+        # Only creates a temporary export-batch record. No teacher, source PDF,
+        # or document rows are modified; no source Storage object is deleted.
+        saved = table("export_batches").insert({
+            "actor_id": request.current_user["id"],
+            "output_format": "folders",
+            "payload": payload,
+        }).execute().data[0]
+        prepared.append({"part": i + 1, "batch_id": saved["id"],
+                         "pdf_count": len(group), "teachers": len(payload)})
+    return jsonify(ok=True, mode=mode, batch_name=batch_name,
+                   total_pdfs=len(documents), groups=prepared,
+                   message="تم تجهيز قائمة الملفات، وليس تنزيل الملفات بعد.")
+
+
+def v13_make_single_pdf(batch, actor_id=None):
+    """Build PDF into a temporary file and save confirmed per-document snapshots.
+
+    Unavailable PDFs are not falsely counted. Missing manifest is also
+    embedded as a UTF-8 CSV attachment in the resulting PDF.
+    """
+    rows = batch.get("payload") or []
+    if not rows:
+        raise UserError("هذه الدفعة فارغة", 409)
+    live = all_records("documents", "teacher_id,kind,storage_path,version,pages", "created_at")
+    current = {(d["teacher_id"], d["kind"]): d for d in live}
+    teacher_data = {t["id"]: t for t in all_records("teachers", "id,full_name,national_id")}
+    writer = PdfWriter()
+    good, missing, available = [], [], {}
+    pages_total = 0
+    for row in rows:
+        teacher = teacher_data.get(row["id"])
+        if not teacher:
+            for f in row.get("files") or []:
+                missing.append([row.get("name", "معلم"), KINDS.get(f["kind"], f["kind"]), "سجل المعلم غير متاح"])
+            continue
+        teacher_outline = None
+        for f in row.get("files") or []:
+            kind = f.get("kind")
+            title = KINDS.get(kind, kind or "مستند")
+            d = current.get((row["id"], kind))
+            if not d:
+                missing.append([teacher["full_name"], title, "سجل المستند غير متاح"])
+                continue
+            item = {"kind": kind, "path": d["storage_path"],
+                    "version": int(d.get("version") or 1),
+                    "pages": int(d.get("pages") or 0)}
+            try:
+                contents, resolved = _export_pdf_with_retries(item, teacher["full_name"], row["id"])
+                reader = PdfReader(io.BytesIO(contents), strict=False)
+                num_pages = len(reader.pages)
+                if not num_pages or (item["pages"] and item["pages"] != num_pages):
+                    raise UserError("عدد صفحات PDF لا يطابق السجل", 409)
+            except UserError as exc:
+                if exc.code in (401, 403, 413):
+                    raise
+                missing.append([teacher["full_name"], title, exc.message])
+                continue
+            except Exception:
+                app.logger.exception("V13 single PDF read failure: teacher_id=%s kind=%s", row["id"], kind)
+                missing.append([teacher["full_name"], title, "ملف PDF غير قابل للقراءة"])
+                continue
+            # Bookmark by teacher and by document. No Unicode fonts needed.
+            start_page = pages_total
+            writer.append(reader, import_outline=False)
+            pages_total += num_pages
+            if teacher_outline is None:
+                teacher_outline = writer.add_outline_item(teacher["full_name"], start_page)
+            writer.add_outline_item(title, start_page, parent=teacher_outline)
+            good.append([teacher["full_name"], title, start_page + 1, num_pages])
+            available.setdefault(row["id"], []).append({
+                "kind": kind, "path": resolved["path"],
+                "version": int(resolved["version"]),
+            })
+    if not good:
+        raise UserError("لا يوجد PDF صالح للدمج؛ لم تتغير المستندات الأصلية.", 503)
+    def csv_bytes(head, data):
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(head)
+        w.writerows(data)
+        return ("\ufeff" + buf.getvalue()).encode("utf-8")
+    # Attachments are included in the ONE output PDF. Some Android PDF viewers
+    # don't display them; the index bookmarks remain visible in compatible apps.
+    writer.add_attachment("كشف_الملفات.csv", csv_bytes(
+        ["اسم المعلم", "المستند", "الصفحة الأولى", "عدد الصفحات"], good))
+    writer.add_attachment("ملفات_تحتاج_استرجاع.csv", csv_bytes(
+        ["اسم المعلم", "المستند", "السبب"], missing))
+    writer.add_metadata({
+        "/Title": "أرشيف المعلمين - " + _flat_batch_name(batch),
+        "/Subject": f"المستندات المتاحة: {len(good)}؛ غير المتاحة: {len(missing)}",
+    })
+    handle = tempfile.TemporaryFile(mode="w+b")
+    try:
+        writer.write(handle)
+        handle.flush()
+        size = handle.tell()
+        if size > 350 * 1024 * 1024:
+            raise UserError("حجم ملف PDF الناتج تجاوز 350MB؛ جرّب خيار ZIP المقسّم.", 413)
+        handle.seek(0)
+        check = PdfReader(handle, strict=False)
+        if len(check.pages) != pages_total:
+            raise UserError("فشل فحص PDF النهائي؛ لم يتم إرسال ملف ناقص.", 503)
+        handle.seek(0)
+        prepared_at = datetime.now(timezone.utc).isoformat()
+        rows_ready = [{**row,
+                       "available_files": available.get(row["id"], []),
+                       "available_built_at": prepared_at}
+                      for row in rows]
+        # Store only files actually included, for user-triggered confirmation.
+        table("export_batches").update({"payload": rows_ready}).eq(
+            "id", batch["id"]).eq("actor_id", actor_id or request.current_user["id"]).is_(
+            "confirmed_at", "null").execute()
+        return handle, size, len(good), len(missing), pages_total
+    except Exception:
+        handle.close()
+        raise
+
+
+@app.get("/api/export/v13/batch/<batch_id>/all-teachers.pdf")
+@login_required(roles=("admin",))
+def v13_download_single_pdf(batch_id):
+    batch = user_batch(batch_id)
+    if not all(row.get("selection") == "v13" for row in batch.get("payload") or []):
+        raise UserError("هذه الدفعة ليست من نوع التصدير الجديد.", 400)
+    handle, size, count, missing, pages = v13_make_single_pdf(batch)
+    try:
+        filename = f"{_flat_batch_name(batch)}_{count}_PDF_merged.pdf"
+        response = send_file(handle, mimetype="application/pdf", as_attachment=True,
+                             download_name=filename, conditional=False)
+        response.content_length = size
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Archive-Pdfs"] = str(count)
+        response.headers["X-Archive-Missing"] = str(missing)
+        response.headers["X-Archive-Pages"] = str(pages)
+        response.call_on_close(handle.close)
+        return response
+    except Exception:
+        handle.close()
+        raise
+
+
+@app.get("/api/export/v13/batch/<batch_id>/status")
+@login_required(roles=("admin",))
+def v13_batch_status(batch_id):
+    batch = user_batch(batch_id)
+    payload = batch.get("payload") or []
+    expected = sum(len(r.get("files") or []) for r in payload)
+    built = sum(len(r.get("available_files") or []) for r in payload)
+    is_ready = all(bool(r.get("available_built_at")) for r in payload) and bool(payload)
+    return jsonify(expected=expected, delivered=built,
+                   unavailable=(expected - built) if is_ready else None,
+                   ready=is_ready, confirmed=bool(batch.get("confirmed_at")))
+
+
+
+# V15 — RENDER-ONLY TEMPORARY EXPORT CACHE (no Cloudflare, no billing connector)
+# Jobs are protected by the same admin-only export batch. Files are private to
+# this Render worker, short-lived, and disappear on restart/sleep/redeploy.
+# Only archive_export_batches.payload metadata is updated; source data remains untouched.
+_V15_JOBS = {}
+_V15_LOCK = threading.RLock()
+_V15_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="render-zip")
+_V15_EXPIRE = 4 * 3600
+
+
+def _v15_cleanup():
+    now = time.monotonic()
+    with _V15_LOCK:
+        for key, val in list(_V15_JOBS.items()):
+            if val.get("status") in ("building", "queued"):
+                continue
+            if now - val.get("updated", now) < _V15_EXPIRE:
+                continue
+            filename = val.get("path")
+            del _V15_JOBS[key]
+            if filename:
+                try:
+                    os.unlink(filename)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    app.logger.warning("V15 temporary file cleanup failed")
+
+
+def _v15_build_job(batch):
+    job_id = batch["id"]
+    handle = None
+    destination = None
+    with app.app_context():
+        try:
+            with _V15_LOCK:
+                _V15_JOBS[job_id] = {"status": "building", "updated": time.monotonic(),
+                    "message": "جارٍ تجميع الملفات السليمة على Render. المستندات الأصلية محفوظة."}
+            rows = batch.get("payload") or []
+            is_pdf = bool(rows and rows[0].get("v13_mode") == "single_pdf")
+            if is_pdf:
+                handle, size, pdf_count, missing, pages = v13_make_single_pdf(
+                    batch, actor_id=batch["actor_id"])
+                ext = "pdf"
+            else:
+                lookup = {r["id"]: r for r in all_records(
+                    "teachers", "id,full_name,national_id,position")}
+                handle, size, _, pdf_count, missing, _, resolved = _build_flat_export(
+                    batch, lookup, available_only=True)
+                # Store only successfully included PDF versions, never mark as
+                # downloaded until the admin opens the file and confirms it.
+                stamp = datetime.now(timezone.utc).isoformat()
+                resolved_by_id = {r["id"]: r["files"] for r in resolved}
+                updated = [{**row, "available_files": resolved_by_id.get(row["id"], []),
+                            "available_built_at": stamp} for row in rows]
+                stored = (table("export_batches").update({"payload": updated})
+                          .eq("id", job_id).eq("actor_id", batch["actor_id"])
+                          .is_("confirmed_at", "null").execute())
+                if not stored.data:
+                    raise UserError("تعذّر حفظ كشف مستندات الدفعة. لم يُسجل أي تنزيل.", 503)
+                ext = "zip"
+            # Disk copy makes standard HTTP Content-Length and Range possible,
+            # without keeping a giant Blob in Chrome's JavaScript memory.
+            import shutil as _shutil
+            with tempfile.NamedTemporaryFile(prefix="private_archive_", suffix="."+ext,
+                                             delete=False, mode="w+b") as file:
+                destination = file.name
+                handle.seek(0)
+                _shutil.copyfileobj(handle, file, length=1024 * 1024)
+                file.flush()
+                os.fsync(file.fileno())
+                if file.tell() != size:
+                    raise UserError("فشل فحص حجم الملف المؤقت، لم يُرسل ملف ناقص.", 503)
+            if ext == "zip":
+                with zipfile.ZipFile(destination) as verify:
+                    if verify.testzip() is not None or sum(
+                        x.filename.lower().endswith(".pdf") for x in verify.infolist()) != pdf_count:
+                        raise UserError("فشل فحص ZIP النهائي، لن يتم إرسال ملف تالف.", 503)
+            else:
+                if len(PdfReader(destination, strict=False).pages) < 1:
+                    raise UserError("لم ينجح التحقق من PDF النهائي.", 503)
+            with _V15_LOCK:
+                _V15_JOBS[job_id] = {"status": "ready", "path": destination,
+                    "format": ext, "bytes": size, "pdfs": pdf_count, "missing": missing,
+                    "updated": time.monotonic(),
+                    "message": "النسخة المؤقتة جاهزة. اضغط تنزيل، ثم افتحها على هاتفك."}
+            destination = None
+        except Exception as exc:
+            app.logger.exception("V15 render-only build failed for batch %s", job_id)
+            message = exc.message if isinstance(exc, UserError) else (
+                "تعذر تجهيز الدفعة في Render مؤقتًا. أعد المحاولة؛ لم تتغير المستندات الأصلية.")
+            with _V15_LOCK:
+                _V15_JOBS[job_id] = {"status": "failed", "updated": time.monotonic(),
+                    "message": message}
+        finally:
+            if handle is not None:
+                handle.close()
+            if destination:
+                try:
+                    os.unlink(destination)
+                except OSError:
+                    pass
+
+
+@app.post("/api/export/batch/<batch_id>/render/start")
+@login_required(roles=("admin",))
+def v15_start_render_export(batch_id):
+    batch = user_batch(batch_id)
+    if batch.get("confirmed_at"):
+        raise UserError("هذه الدفعة مؤكدة سابقًا. أنشئ دفعة جديدة عند الحاجة.", 409)
+    if not all(r.get("selection") == "v13" for r in batch.get("payload") or []):
+        raise UserError("هذا الخيار مخصص لدفعات التصدير الجديدة.", 400)
+    _v15_cleanup()
+    with _V15_LOCK:
+        prior = _V15_JOBS.get(batch["id"])
+        if prior and prior.get("status") in ("queued", "building", "ready"):
+            if prior.get("status") != "ready" or os.path.isfile(prior.get("path", "")):
+                return jsonify(**{k:v for k,v in prior.items() if k != "path"})
+        _V15_JOBS[batch["id"]] = {"status":"queued", "updated":time.monotonic(),
+                                  "message":"تم إدراج الدفعة للتجهيز."}
+    _V15_EXECUTOR.submit(_v15_build_job, batch)
+    return jsonify(status="queued", message="بدأ تجهيز النسخة المؤقتة في Render.")
+
+
+@app.get("/api/export/batch/<batch_id>/render/status")
+@login_required(roles=("admin",))
+def v15_render_export_status(batch_id):
+    batch = user_batch(batch_id)
+    _v15_cleanup()
+    with _V15_LOCK:
+        state = dict(_V15_JOBS.get(batch["id"], {}))
+    if state.get("status") == "ready" and not os.path.isfile(state.get("path", "")):
+        state = {"status":"not_started", "message":
+                 "أعاد Render تشغيل الخدمة وفُقد الملف المؤقت. اضغط تجهيز مجددًا."}
+    return jsonify(**{k:v for k,v in state.items() if k != "path"}) if state else jsonify(
+        status="not_started", message="اضغط تجهيز الدفعة أولًا.")
+
+
+@app.get("/api/export/batch/<batch_id>/render/download")
+@login_required(roles=("admin",))
+def v15_render_export_download(batch_id):
+    batch = user_batch(batch_id)
+    with _V15_LOCK:
+        state = dict(_V15_JOBS.get(batch["id"], {}))
+    filename = state.get("path", "")
+    if state.get("status") != "ready" or not filename or not os.path.isfile(filename):
+        raise UserError("الملف المؤقت غير جاهز؛ اضغط تجهيز مرة أخرى.", 409)
+    ext = state["format"]
+    nice = f"{_flat_batch_name(batch)}_{state['pdfs']}_PDF.{ext}"
+    reply = send_file(filename, as_attachment=True, download_name=nice,
+                      mimetype="application/pdf" if ext == "pdf" else "application/zip",
+                      conditional=True, max_age=0)
+    reply.headers["Cache-Control"] = "private, no-store"
+    reply.headers["X-Archive-Pdfs"] = str(state["pdfs"])
+    reply.headers["X-Archive-Missing"] = str(state["missing"])
+    return reply
+
+
+# V14: Optional prebuilt ZIP/PDF in an independent, PRIVATE R2 download cache.
+# Never changes or deletes source teacher rows / original PDFs. A batch UUID
+# is private to one authenticated admin and can have one immutable ready object.
+_READY_EXPORT_WORKERS = ThreadPoolExecutor(max_workers=1, thread_name_prefix="archive-ready")
+_READY_EXPORT_JOBS = {}
+_READY_EXPORT_LOCK = threading.Lock()
+
+
+def ready_r2_client():
+    required = ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")
+    missing = [name for name in required if not os.environ.get(name, "").strip()]
+    if missing:
+        raise UserError("التنزيل المباشر يحتاج إعداد R2 في Render: " + ", ".join(missing), 503)
+    import boto3
+    from botocore.config import Config
+    account = os.environ["R2_ACCOUNT_ID"].strip()
+    if not re.fullmatch(r"[a-fA-F0-9]{32}", account):
+        raise UserError("R2_ACCOUNT_ID غير صحيح؛ انسخ Account ID من Cloudflare.", 503)
+    # Standard R2 endpoint; use a different R2 region endpoint if the bucket
+    # was explicitly created in a jurisdiction-restricted location.
+    endpoint = os.environ.get("R2_ENDPOINT_URL", "").strip() or f"https://{account}.r2.cloudflarestorage.com"
+    if not endpoint.startswith('https://') or 'r2.cloudflarestorage.com' not in endpoint:
+        raise UserError("R2_ENDPOINT_URL يجب أن يكون رابط R2 الرسمي الآمن.", 503)
+    return boto3.client(
+        "s3", endpoint_url=endpoint, region_name="auto",
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"].strip(),
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"].strip(),
+        config=Config(signature_version="s3v4", connect_timeout=12,
+                      read_timeout=90, retries={"max_attempts": 3, "mode": "standard"}),
+    )
+
+
+def ready_r2_bucket():
+    return os.environ["R2_BUCKET"].strip()
+
+
+def ready_export_format(batch):
+    rows = batch.get("payload") or []
+    if rows and rows[0].get("v13_mode") == "single_pdf":
+        return "pdf"
+    return "zip"
+
+
+def ready_r2_key(batch):
+    ext = ready_export_format(batch)
+    return f"private-ready-exports/{batch['id']}.{ext}"
+
+
+def ready_head(client, key):
+    from botocore.exceptions import ClientError
+    try:
+        return client.head_object(Bucket=ready_r2_bucket(), Key=key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+            return None
+        raise
+
+
+def _ready_export_worker(batch):
+    job_id = batch["id"]
+    key = ready_r2_key(batch)
+    fmt = ready_export_format(batch)
+    handle = None
+    with app.app_context():
+        try:
+            with _READY_EXPORT_LOCK:
+                _READY_EXPORT_JOBS[job_id] = {"status": "building", "message": "جارٍ تجهيز المستندات المتاحة والتحقق منها"}
+            client = ready_r2_client()
+            if fmt == "pdf":
+                if not all(row.get("selection") == "v13" for row in batch.get("payload") or []):
+                    raise UserError("ملف PDF الواحد متاح لدفعات V13 وما بعدها فقط.", 400)
+                # Saves the set of successfully merged per-kind PDFs into the
+                # export batch; original archive remains unchanged.
+                handle, size, pdfs, missing, pages = v13_make_single_pdf(batch, actor_id=batch["actor_id"])
+                mime = "application/pdf"
+            else:
+                teachers = {t["id"]: t for t in all_records("teachers", "id,full_name,national_id,position")}
+                handle, size, _, pdfs, missing, _, resolved = _build_flat_export(
+                    batch, teachers, available_only=True)
+                if not resolved or pdfs <= 0:
+                    raise UserError("لا توجد مستندات PDF سليمة في الدفعة؛ لم يتغير الأرشيف.", 503)
+                mime = "application/zip"
+            if fmt == "zip":
+                # Record verified contents BEFORE uploading the disposable R2
+                # cache. The record is NOT a download confirmation. If Render
+                # restarts after uploading, the link can safely be recovered.
+                stamp = datetime.now(timezone.utc).isoformat()
+                actual = {row["id"]: row["files"] for row in resolved}
+                updated = [{**row, "available_files": actual.get(row["id"], []),
+                            "available_built_at": stamp} for row in batch["payload"]]
+                stored = (table("export_batches").update({"payload": updated})
+                          .eq("id", job_id).eq("actor_id", batch["actor_id"]).execute())
+                if not stored.data:
+                    raise UserError("تعذر تسجيل المستندات المضمنة؛ لم يبدأ رفع ZIP.", 503)
+            from boto3.s3.transfer import TransferConfig
+            # Arabic name works in modern Chrome while ASCII remains fallback.
+            readable = f"{_flat_batch_name(batch)} - {pdfs} مستند.{'pdf' if fmt == 'pdf' else 'zip'}"
+            ascii_name = f"school_archive_{job_id[:8]}_{pdfs}_documents.{fmt}"
+            disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(readable)}"
+            handle.seek(0)
+            client.upload_fileobj(
+                handle, ready_r2_bucket(), key,
+                ExtraArgs={"ContentType": mime,
+                           "ContentDisposition": disposition,
+                           "Metadata": {"pdf-count": str(pdfs), "missing-count": str(missing)}},
+                Config=TransferConfig(multipart_threshold=8 * 1024 * 1024,
+                                      multipart_chunksize=8 * 1024 * 1024,
+                                      max_concurrency=2))
+            meta = ready_head(client, key)
+            if not meta or int(meta.get("ContentLength", 0)) != int(size):
+                raise UserError("لم يتم التحقق من حجم الملف في R2؛ لا تؤكد التنزيل.", 503)
+            with _READY_EXPORT_LOCK:
+                _READY_EXPORT_JOBS[job_id] = {
+                    "status": "ready", "pdfs": pdfs, "missing": missing,
+                    "bytes": size, "format": fmt,
+                    "message": "الملف جاهز للتنزيل المباشر إلى الهاتف"}
+        except Exception as exc:
+            app.logger.exception("Ready export failed for batch %s", job_id)
+            message = exc.message if isinstance(exc, UserError) else (
+                "تعذر تجهيز الملف أو رفعه إلى R2. راجع سجل Render وإعدادات التخزين.")
+            with _READY_EXPORT_LOCK:
+                _READY_EXPORT_JOBS[job_id] = {"status": "failed", "message": message}
+        finally:
+            if handle is not None:
+                handle.close()
+
+
+@app.post("/api/export/batch/<batch_id>/ready/start")
+@login_required(roles=("admin",))
+def start_ready_zip(batch_id):
+    batch = user_batch(batch_id)
+    if batch.get("confirmed_at"):
+        raise UserError("تم تأكيد الدفعة سابقًا. جهّز دفعة جديدة للملفات الجديدة.", 409)
+    if batch["output_format"] != "folders":
+        raise UserError("اختر نوع التصدير الصحيح من صفحة التصدير.", 400)
+    client = ready_r2_client()
+    key = ready_r2_key(batch)
+    found = ready_head(client, key)
+    if found and batch.get('payload') and all(row.get('available_built_at') for row in batch['payload']):
+        return jsonify(status="ready", format=ready_export_format(batch),
+                       bytes=int(found.get("ContentLength") or 0),
+                       message="الملف موجود وجاهز. اضغط تنزيل مباشر.")
+    if found:
+        raise UserError("هناك نسخة جاهزة لكن كشف الملفات غير مكتمل؛ راجع سجل Render قبل تأكيدها.", 503)
+    with _READY_EXPORT_LOCK:
+        job = _READY_EXPORT_JOBS.get(batch["id"])
+        if job and job["status"] in ("building", "queued"):
+            return jsonify(**job)
+        _READY_EXPORT_JOBS[batch["id"]] = {"status": "queued", "message": "أُضيفت الدفعة للتجهيز"}
+    _READY_EXPORT_WORKERS.submit(_ready_export_worker, batch)
+    return jsonify(status="queued", message="بدأ تجهيز الملف مرة واحدة")
+
+
+@app.get("/api/export/batch/<batch_id>/ready/status")
+@login_required(roles=("admin",))
+def ready_zip_status(batch_id):
+    batch = user_batch(batch_id)
+    with _READY_EXPORT_LOCK:
+        job = dict(_READY_EXPORT_JOBS.get(batch["id"], {}))
+    if job.get("status") in ("queued", "building"):
+        return jsonify(**job)
+    # R2 survives Render restarts; check it before returning stale in-memory errors.
+    found = ready_head(ready_r2_client(), ready_r2_key(batch))
+    ready_receipt = bool(batch.get('payload')) and all(
+        row.get('available_built_at') for row in batch['payload'])
+    if found and ready_receipt:
+        return jsonify(status="ready", format=ready_export_format(batch),
+                       bytes=int(found.get("ContentLength") or 0),
+                       pdfs=int(found.get('Metadata', {}).get('pdf-count', '0')),
+                       missing=int(found.get('Metadata', {}).get('missing-count', '0')),
+                       message="الملف جاهز في R2")
+    if job.get("status") == "failed":
+        return jsonify(**job)
+    return jsonify(status="not_started", message="لم يكتمل التجهيز؛ أعد بدءه")
+
+
+@app.get("/api/export/batch/<batch_id>/ready/link")
+@login_required(roles=("admin",))
+def ready_zip_download_link(batch_id):
+    batch = user_batch(batch_id)
+    client = ready_r2_client()
+    key = ready_r2_key(batch)
+    meta = ready_head(client, key)
+    if not meta:
+        raise UserError("الملف غير جاهز في التخزين بعد.", 409)
+    if not batch.get('payload') or not all(row.get('available_built_at') for row in batch['payload']):
+        raise UserError("فحص الملف لم يكتمل بعد؛ لا يمكن تنزيل نسخة غير موثقة.", 409)
+    url = client.generate_presigned_url("get_object", Params={
+        "Bucket": ready_r2_bucket(), "Key": key}, ExpiresIn=1800)
+    return jsonify(url=url, format=ready_export_format(batch),
+                   bytes=int(meta.get("ContentLength") or 0),
+                   message="الرابط خاص وصالح لمدة 30 دقيقة؛ لا تشاركه.")
 
 
 # V11: private, time-limited direct download manifest. Nothing is deleted or
