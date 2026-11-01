@@ -398,6 +398,20 @@ def get_doc(id_):
     return found[0]
 
 
+@app.get("/api/teachers/<teacher_id>/documents/<kind>/version")
+@login_required(roles=("admin", "scanner"))
+def current_document_version(teacher_id, kind):
+    """Lightweight version check before phone uploads (no PDF download).
+
+    The client uses this to reconcile its outdated screen. The server still
+    enforces compare-and-swap on save to prevent lost updates between devices.
+    """
+    item = find_doc(teacher_id, kind)
+    return jsonify(exists=bool(item), id=item["id"] if item else None,
+                   version=int(item["version"]) if item else 0,
+                   pages=int(item["pages"]) if item else 0)
+
+
 def require_document_editor(doc):
     """Staff photographers may correct any saved teacher document.
 
@@ -583,6 +597,14 @@ def images_as_pdf(files, mode="scan", points_json=None):
         raise UserError("تعذر قراءة حدود قص الصورة")
     if not isinstance(points_list, list) or len(points_list) != len(files):
         raise UserError("عدد حدود القص لا يطابق عدد الصور")
+    # Fast path for the common case: one photo = one PDF page. Avoid reading
+    # and rewriting the PDF a second time just to copy one page.
+    if len(files) == 1:
+        f = files[0]
+        if not (f.mimetype or "").startswith("image/"):
+            raise UserError("يُسمح برفع الصور فقط")
+        result, cropped = image_pdf(f.read(MAX_IMAGE + 1), mode, points_list[0])
+        return result, int(cropped)
     writer, cropped_count = PdfWriter(), 0
     for f, points in zip(files, points_list):
         if not (f.mimetype or "").startswith("image/"):
@@ -664,26 +686,51 @@ def upload_doc(teacher_id, kind):
     teacher = teacher_by_id(teacher_id)
     if kind not in KINDS:
         raise UserError("نوع المستند غير معروف")
-    new_pdf, cropped = images_as_pdf(request.files.getlist("images"), request.form.get("quality", "scan"), request.form.get("crop_points"))
     mode = request.form.get("mode", "append")
+    if mode not in ("append", "replace"):
+        raise UserError("اختر إضافة صفحات أو استبدال المستند")
+
+    # Check replacement conflicts BEFORE image processing. The browser also
+    # checks freshness before starting the upload, but that alone is not safe
+    # when multiple phones are scanning at the same time.
+    expected = request.form.get("expected_version", "0")
     old = find_doc(teacher_id, kind)
-    # Photographers can fix any teacher document; admin controls management/exports.
     if old:
         require_document_editor(old)
-    if old:
-        check_document_version(old, request.form.get("expected_version"), required=True)
-    else:
-        raw_expected = request.form.get("expected_version", "0")
-        if raw_expected not in ("", "0"):
-            raise UserError("تم تصوير هذا المستند من جهاز آخر؛ حدّث القائمة.", 409)
-    final = new_pdf
-    if old and mode == "append":
-        final = merge_pdfs(storage().download(old["storage_path"]), new_pdf, "append")
-    elif mode not in ("append", "replace"):
-        raise UserError("اختر إضافة صفحات أو استبدال المستند")
-    saved = save_doc(teacher_id, kind, final,
-                     (old["pages"] if old and mode == "append" else 0) +
-                     len(request.files.getlist("images")), old)
+        if mode == "replace":
+            check_document_version(old, expected, required=True)
+    elif mode == "replace" and expected not in ("", "0"):
+        raise UserError("المستند حُذف من جهاز آخر. أعد مراجعة الملف قبل حفظ البديل.", 409)
+
+    files = request.files.getlist("images")
+    new_pdf, cropped = images_as_pdf(
+        files, request.form.get("quality", "scan"), request.form.get("crop_points"))
+
+    # Appending new pages is non-destructive. If two phones append together,
+    # fetch the newer PDF and retry with the same new pages; conditional DB
+    # writes inside save_doc make sure neither phone can silently erase work.
+    # Full replacement, unlike append, must never auto-rebase.
+    for attempt in range(3 if mode == "append" else 1):
+        current = find_doc(teacher_id, kind)
+        if current:
+            require_document_editor(current)
+        if mode == "replace":
+            if current:
+                check_document_version(current, expected, required=True)
+            elif expected not in ("", "0"):
+                raise UserError("المستند حُذف من جهاز آخر. حدّث قائمة المعلمين.", 409)
+        final = new_pdf
+        if current and mode == "append":
+            final = merge_pdfs(storage().download(current["storage_path"]), new_pdf, "append")
+        page_count = (current["pages"] if current and mode == "append" else 0) + len(files)
+        try:
+            saved = save_doc(teacher_id, kind, final, page_count, current)
+            break
+        except UserError as exc:
+            if mode != "append" or exc.code != 409 or attempt == 2:
+                raise
+            app.logger.info("Concurrent page append, rebasing once more: teacher=%s kind=%s",
+                            teacher_id, kind)
     audit_new_document("تعديل مستند" if old else "تصوير مستند", teacher, kind)
     return jsonify(document=saved, auto_crop_count=cropped)
 
