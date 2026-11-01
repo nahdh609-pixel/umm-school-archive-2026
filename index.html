@@ -148,7 +148,7 @@ input::placeholder,textarea::placeholder{color:#9eb2c2!important;opacity:1}input
 </head>
 <body>
 <div id="loginScreen" class="shell hidden"><div class="login card center"><div class="logo">🗂️</div><h1>أرشيف شؤون المعلمين</h1><p class="muted">مدرسة أم المؤمنين للتعليم الأساسي</p><form id="loginForm" style="text-align:right"><div class="field"><label>اسم المستخدم</label><input name="username" autocomplete="username" required></div><div class="field"><label>كلمة المرور</label><input type="password" name="password" autocomplete="current-password" required></div><br><button class="btn primary full" type="submit">دخول المنظومة</button></form><p class="small muted">حسابات المستخدمين ينشئها المسؤول فقط</p></div></div>
-<div id="mainScreen" class="hidden"><header class="top"><div class="topinner"><div class="brand"><span class="brand-mark">▣</span> أرشيف المعلمين <span class="version-pill">🌙 V10</span><small>مدرسة أم المؤمنين للتعليم الأساسي · الوضع الليلي</small></div><div class="flex"><span id="who" class="small"></span><button class="btn sm outline" onclick="logout()">خروج</button></div></div></header><main class="shell"><div class="nav"><button data-tab="home" class="on" onclick="tab('home')">⌂ الرئيسية</button><button data-tab="notifications" id="navNotifications" onclick="tab('notifications')">🔔 الإشعارات <span id="unreadBadge" class="event-badge hidden">0</span></button><button data-tab="teachers" onclick="tab('teachers')">▤ المعلمون</button><button data-tab="users" id="navUsers" onclick="tab('users')">♙ المستخدمون</button><button data-tab="exports" onclick="tab('exports')">⇩ التصدير</button></div><div id="view" style="margin-top:16px"></div></main><footer class="foot">الأرشيف الإلكتروني — المستندات خاصة ولا تظهر إلا للمستخدمين المصرّح لهم</footer></div>
+<div id="mainScreen" class="hidden"><header class="top"><div class="topinner"><div class="brand"><span class="brand-mark">▣</span> أرشيف المعلمين <span class="version-pill">🌙 V11</span><small>مدرسة أم المؤمنين للتعليم الأساسي · الوضع الليلي</small></div><div class="flex"><span id="who" class="small"></span><button class="btn sm outline" onclick="logout()">خروج</button></div></div></header><main class="shell"><div class="nav"><button data-tab="home" class="on" onclick="tab('home')">⌂ الرئيسية</button><button data-tab="notifications" id="navNotifications" onclick="tab('notifications')">🔔 الإشعارات <span id="unreadBadge" class="event-badge hidden">0</span></button><button data-tab="teachers" onclick="tab('teachers')">▤ المعلمون</button><button data-tab="users" id="navUsers" onclick="tab('users')">♙ المستخدمون</button><button data-tab="exports" onclick="tab('exports')">⇩ التصدير</button></div><div id="view" style="margin-top:16px"></div></main><footer class="foot">الأرشيف الإلكتروني — المستندات خاصة ولا تظهر إلا للمستخدمين المصرّح لهم</footer></div>
 <div id="modalLayer" class="overlay hidden"><div class="modal"><div class="between"><h2 id="modalTitle" style="margin:0"></h2><button class="btn sm secondary" onclick="closeModal()">✕ إغلاق</button></div><div id="modalBody" style="margin-top:14px"></div></div></div>
 <div id="toast" class="toast hidden"></div>
 <div id="printReport" lang="ar" dir="rtl" aria-hidden="true"></div>
@@ -714,7 +714,7 @@ async function changePassword(id){let p=prompt('كلمة مرور جديدة (10
 function renderExports(){
  if(user.role!=='admin')return tab('home');
  const complete=teachers.filter(t=>filled(t.id)===5).length;
- el('view').innerHTML=`<div class="export-hero"><div class="export-hero-icon">⇩</div><div><div class="hero-kicker">🌙 إصدار V10 · تنزيل مباشر للهاتف</div><h2>دفعات التنزيل</h2><p>مجلد واحد باسم تختاره، يحتوي ملفات PDF منفصلة باسم المعلم ونوع المستند، وكشفًا بالأعداد الفعلية.</p></div></div>
+ el('view').innerHTML=`<div class="export-hero"><div class="export-hero-icon">⇩</div><div><div class="hero-kicker">🌙 إصدار V11 · تنزيل مباشر إلى الهاتف</div><h2>دفعات التنزيل</h2><p>مجلد واحد باسم تختاره، يحتوي ملفات PDF منفصلة باسم المعلم ونوع المستند، وكشفًا بالأعداد الفعلية.</p></div></div>
  <div class="card"><h3>🛠️ فحص وإصلاح روابط PDF القديمة</h3>
  <p class="muted">إذا ظهر Object not found، يفحص النظام النسخ الموجودة في مجلد المعلم، ويصلح الرابط فقط عند العثور على PDF سليم بنفس عدد الصفحات. لا يحذف أي صور أو ملفات.</p>
  <button id="repairArchiveButton" class="btn primary full" onclick="repairArchive()">🔍 فحص وإصلاح الأرشيف الموجود</button>
@@ -855,7 +855,13 @@ async function exportBatch(){
   showModal('📦 تنزيل أرشيف المعلمين',`<p class="batch-note"><b>المجلد: ${esc(result.batch_name)}</b><br>عدد المعلمين: <b>${result.count}</b> — عدد مستندات PDF المطلوبة: <b>${result.document_count}</b>.<br>الجديد: ${result.summary.new}، المحدّث: ${result.summary.updated}، السابق: ${result.summary.previous}.</p>
   <p class="muted">${payload.format==='folders' ? 'بعد فك الضغط ستجد مجلدًا واحدًا باسم <b>'+esc(result.batch_name)+'</b> وفيه ملفات PDF المنفصلة وكشف_الملفات.csv.' : 'هذه الصيغة الاختيارية تنتج PDF واحدًا مجمّعًا لكل معلم، ولا تستخدم المجلد الواحد.'}</p>
   <p class="download-advice">✅ <b>الطريقة الموصى بها للهاتف:</b> تنزيل ZIP مباشرة من الخادم إلى مدير تنزيلات Chrome، حتى لو كانت هناك مستندات تحتاج استرجاعًا. داخل المجلد كشف بأسماء الملفات المتاحة والمتعثرة.</p>
-  <button id="downloadAvailableButton" type="button" class="btn primary full" onclick="downloadAvailableOnly()">⬇ تنزيل ملفات PDF الموجودة الآن إلى الهاتف</button>
+  <div class="batch-note" style="border-color:#188e88;background:#102d36;color:#e3f9f5"><b>⚡ V11 — تنزيل سريع مباشر</b><p class="small">تصل ملفات PDF من Supabase مباشرة إلى هاتفك، وتُجمع في ZIP واحد باسم الدفعة. لا يُمرَّر ZIP عبر Render.</p></div>
+  <button id="directPhoneButton" type="button" class="btn primary full" onclick="downloadDirectToPhone()">⚡ تنزيل سريع — دفعة واحدة إلى الهاتف</button>
+  <p id="directPhoneStatus" class="small muted">يفضَّل فتح المنظومة في Chrome على الهاتف. إذا دعم متصفحك الحفظ المباشر سنستخدمه لتقليل استهلاك الذاكرة.</p>
+  <button id="confirmDirectButton" class="btn secondary full" disabled onclick="confirmDirectDownloaded()">✅ فتحت ZIP على الهاتف وتأكدت من محتوياته</button>
+  <hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
+  <p class="small muted">تنزيل احتياطي عبر Render إن تعذر التنزيل المباشر:</p>
+  <button id="downloadAvailableButton" type="button" class="btn outline full" onclick="downloadAvailableOnly()">⬇ تنزيل احتياطي عبر الخادم</button>
   <p id="availableStatus" class="small muted">بعد اكتمال التنزيل، افتح ZIP من مدير الملفات وافحص المستندات قبل التأكيد.</p>
   <button id="confirmAvailableButton" class="btn secondary full" disabled onclick="confirmAvailableDownloaded()">✅ فتحت ZIP وتأكدت من وصول ملفات PDF الموجودة</button><br><br>
   <button id="startZipDownload" class="btn outline full" onclick="downloadPrepared()">محاولة تنزيل كامل دون أي مستند ناقص (اختياري)</button>
@@ -923,6 +929,169 @@ async function downloadPrepared(){
  }catch(e){downloadValidated=false;if(message)message.textContent='❌ '+e.message+' — لم يتم تسجيل أي تنزيل لهذه الدفعة.';notify(e.message,true)}
  finally{if(b){b.disabled=false;b.textContent='↻ إعادة تنزيل ZIP'}}
 }
+
+// V11: ZIP-store without recompression. If the browser provides a native
+// writable file picker we stream to disk; otherwise Blob fallback works for
+// moderate batches but may require more memory on older Android browsers.
+const fastZipEncoder=new TextEncoder();
+const fastZipCrcTable=(()=>{
+ const table=new Uint32Array(256);
+ for(let n=0;n<256;n++){
+  let c=n;for(let k=0;k<8;k++)c=(c>>>1)^(c&1?0xedb88320:0);
+  table[n]=c>>>0;
+ }
+ return table;
+})();
+function fastZipCrc32(data){
+ let c=0xffffffff;
+ for(let i=0;i<data.length;i++)c=fastZipCrcTable[(c^data[i])&255]^(c>>>8);
+ return (c^0xffffffff)>>>0;
+}
+function fastZipTime(){const d=new Date();return {
+ time:(d.getHours()<<11)|(d.getMinutes()<<5)|Math.floor(d.getSeconds()/2),
+ date:((Math.max(1980,d.getFullYear())-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate()
+}}
+function createFastZipSink(writable){
+ const chunks=[],central=[];let offset=0,entries=0,closed=false;
+ const write=async data=>{if(!data?.byteLength)return;if(offset+data.byteLength>=4294967295)throw Error('حجم ZIP تجاوز حد 4GB لهذا المتصفح.');
+   if(writable)await writable.write(data);else chunks.push(data);
+   offset+=data.byteLength};
+ const stamp=fastZipTime();
+ const entry=async(name,payload)=>{
+  if(closed)throw Error('تم إغلاق ZIP');
+  const fileName=fastZipEncoder.encode(name);
+  const data=payload instanceof Uint8Array?payload:new Uint8Array(payload);
+  if(data.byteLength>=4294967295||fileName.length>65535||entries>=65535)throw Error('ملف كبير جدًا');
+  const crc=fastZipCrc32(data),size=data.byteLength,begin=offset;
+  const header=new Uint8Array(30+fileName.length),v=new DataView(header.buffer);
+  v.setUint32(0,0x04034b50,true);v.setUint16(4,20,true);v.setUint16(6,0x0800,true);
+  v.setUint16(8,0,true);v.setUint16(10,stamp.time,true);v.setUint16(12,stamp.date,true);
+  v.setUint32(14,crc,true);v.setUint32(18,size,true);v.setUint32(22,size,true);
+  v.setUint16(26,fileName.length,true);header.set(fileName,30);
+  await write(header);await write(data);
+  const dir=new Uint8Array(46+fileName.length),dv=new DataView(dir.buffer);
+  dv.setUint32(0,0x02014b50,true);dv.setUint16(4,20,true);dv.setUint16(6,20,true);
+  dv.setUint16(8,0x0800,true);dv.setUint16(10,0,true);
+  dv.setUint16(12,stamp.time,true);dv.setUint16(14,stamp.date,true);
+  dv.setUint32(16,crc,true);dv.setUint32(20,size,true);dv.setUint32(24,size,true);
+  dv.setUint16(28,fileName.length,true);dv.setUint32(42,begin,true);dir.set(fileName,46);
+  central.push(dir);entries++;
+ };
+ const finish=async()=>{
+  if(closed)throw Error('تم الإغلاق');closed=true;
+  const centralStart=offset;
+  for(const d of central)await write(d);
+  const centralSize=offset-centralStart,end=new Uint8Array(22),dv=new DataView(end.buffer);
+  dv.setUint32(0,0x06054b50,true);dv.setUint16(8,entries,true);
+  dv.setUint16(10,entries,true);dv.setUint32(12,centralSize,true);
+  dv.setUint32(16,centralStart,true);await write(end);
+  if(writable){await writable.close();return {entries,bytes:offset,blob:null}}
+  return {entries,bytes:offset,blob:new Blob(chunks,{type:'application/zip'})};
+ };
+ return {entry,finish,abort:async()=>{if(writable){try{await writable.abort()}catch(e){}}},get entries(){return entries}};
+}
+function fastCsvCell(value){return '"'+String(value??'').replace(/"/g,'""')+'"'}
+function fastCsv(rows){return fastZipEncoder.encode('\uFEFF'+rows.map(row=>row.map(fastCsvCell).join(',')).join('\r\n')+'\r\n')}
+function fastSafeZipName(s){return String(s||'الدفعة').replace(/[\\/:*?"<>|\x00-\x1f]/g,'_').trim().slice(0,65)||'الدفعة'}
+function fastStatus(message){const e=el('directPhoneStatus');if(e)e.textContent=message}
+const sleepFast=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function fetchDirectPdf(item){
+ let last='اتصال غير مستقر';
+ for(let attempt=0;attempt<4;attempt++){
+  const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),90000);
+  try{
+   const response=await fetch(item.url,{method:'GET',mode:'cors',credentials:'omit',cache:'no-store',signal:ctrl.signal});
+   if(!response.ok){last=`HTTP ${response.status}`;
+    if([400,401,403,404,410].includes(response.status))break;
+    throw Error(last);
+   }
+   const bytes=new Uint8Array(await response.arrayBuffer());
+   if(bytes.length<8||bytes[0]!==37||bytes[1]!==80||bytes[2]!==68||bytes[3]!==70||bytes[4]!==45){
+    last='الملف ليس PDF صالحًا';break;
+   }
+   return {item,bytes};
+  }catch(err){last=err.name==='AbortError'?'انتهت مهلة الاتصال':(err.message||'فشل الاتصال');
+   if(attempt<3)await sleepFast(500*Math.pow(2,attempt));
+  }finally{clearTimeout(timer)}
+ }
+ return {item,error:last};
+}
+let directBusy=false;
+async function downloadDirectToPhone(){
+ if(!preparedBatch||directBusy)return;
+ if(el('zipFormat')?.value!=='folders')return notify('اختر مجلد دفعة واحدًا وملفات PDF منفصلة للتنزيل السريع.',true);
+ // Picker MUST be invoked synchronously from click before any network await.
+ let handle=null;
+ const fileLabel=fastSafeZipName(preparedBatchName)+'_'+preparedBatch.slice(0,8)+'.zip';
+ if(typeof window.showSaveFilePicker==='function'){
+  try{handle=await window.showSaveFilePicker({suggestedName:fileLabel,
+   types:[{description:'ZIP archive',accept:{'application/zip':['.zip']}}]});}
+  catch(e){if(e.name==='AbortError')return;handle=null;}
+ }
+ directBusy=true;
+ const button=el('directPhoneButton');if(button){button.disabled=true;button.textContent='جاري التنزيل المباشر...'}
+ let sink=null;
+ try{
+  fastStatus('جارٍ جلب روابط PDF المؤقتة من Supabase...');
+  const manifest=await api(`/api/export/batch/${encodeURIComponent(preparedBatch)}/direct-manifest`,{method:'GET'});
+  const entries=manifest.items||[];
+  if(!entries.length)throw Error('لا توجد مستندات PDF قابلة للتنزيل. افتح كشف الملفات غير المتاحة.');
+  const writer=handle?await handle.createWritable():null;
+  sink=createFastZipSink(writer);
+  const folder=fastSafeZipName(manifest.batch_name)+'/';
+  const delivered=[],failed=[...(manifest.problems||[])],records=[];
+  // Four direct connections at a time. Retain at most four downloaded PDFs
+  // in memory rather than fetching hundreds into a single huge Promise.all.
+  for(let pos=0;pos<entries.length;pos+=4){
+   const group=entries.slice(pos,pos+4);
+   const responses=await Promise.all(group.map(fetchDirectPdf));
+   for(const outcome of responses){
+    const it=outcome.item;
+    if(outcome.error){failed.push({teacher:it.teacher,kind:it.kind_title,reason:outcome.error});}
+    else{
+     const zipFile=folder+it.filename;
+     await sink.entry(zipFile,outcome.bytes);
+     delivered.push({teacher_id:it.teacher_id,kind:it.kind,path:it.path,version:it.version});
+     records.push([it.teacher,it.kind_title,it.filename,it.version]);
+    }
+   }
+   fastStatus(`📥 تم تنزيل وتجهيز ${delivered.length} PDF من ${manifest.expected} • المتعذر: ${failed.length} • لا تغلق الصفحة`);
+  }
+  if(!delivered.length)throw Error('تعذر تنزيل جميع ملفات PDF؛ لم يُنشأ ZIP فارغ ولم يُسجّل شيء.');
+  await sink.entry(folder+'كشف_الملفات.csv',fastCsv([['اسم المعلم','نوع المستند','اسم الملف','النسخة'],...records]));
+  await sink.entry(folder+'ملفات_تحتاج_استرجاع.csv',fastCsv([['اسم المعلم','نوع المستند','السبب'],...failed.map(x=>[x.teacher,x.kind,x.reason])]));
+  await sink.entry(folder+'معلومات_الدفعة.txt',fastZipEncoder.encode('اسم الدفعة: '+manifest.batch_name+'\nعدد ملفات PDF: '+delivered.length+'\nعدد الملفات المتعذرة: '+failed.length+'\nهذه نسخة تنزيل فقط. لم تُحذف أو تُعدّل الملفات الأصلية.\n'));
+  fastStatus('تم تجهيز الملفات. جارٍ إنهاء ZIP وكتابة الفهرس...');
+  const result=await sink.finish();sink=null;
+  if(result.entries!==delivered.length+3)throw Error('خطأ فحص عدد محتويات ZIP');
+  if(result.blob){
+   const u=URL.createObjectURL(result.blob),a=document.createElement('a');
+   a.href=u;a.download=fileLabel;document.body.appendChild(a);a.click();a.remove();
+   setTimeout(()=>URL.revokeObjectURL(u),180000);
+  }
+  // This stores a snapshot of which PDFs the client packaged. It DOES NOT
+  // mark them as downloaded until the user opens the ZIP and confirms it.
+  await api(`/api/export/batch/${encodeURIComponent(preparedBatch)}/direct-record`,{
+   method:'POST',body:JSON.stringify({files:delivered})});
+  fastStatus(`✅ تم تجهيز ZIP واحد: ${delivered.length} PDF • المتعذر: ${failed.length} • ${(result.bytes/1048576).toFixed(1)} MB. افتحه على الهاتف ثم أكد الوصول.\n${failed.length?'راجع ملفات_تحتاج_استرجاع.csv داخل ZIP.':''}`);
+  const ok=el('confirmDirectButton');if(ok)ok.disabled=false;
+  notify('✅ انتهى تجميع '+delivered.length+' PDF في ZIP واحد. افتحه وتأكد من وصوله.');
+ }catch(err){
+  if(sink)await sink.abort();
+  fastStatus('❌ '+err.message+' — لم تُسجل الدفعة كمنزّلة. يمكنك إعادة المحاولة أو استخدام التنزيل الاحتياطي.');
+  notify('تعذر التنزيل المباشر: '+err.message,true);
+ }finally{directBusy=false;if(button){button.disabled=false;button.textContent='⚡ إعادة التنزيل السريع — دفعة واحدة'}}
+}
+async function confirmDirectDownloaded(){
+ if(!preparedBatch)return notify('جهّز دفعة أولًا',true);
+ if(!confirm('هل فتحت ZIP على هاتفك وتأكدت أنه يحتوي ملفات PDF المذكورة في كشف_الملفات.csv؟ الملفات المتعذرة لا تُحسب منزلة.'))return;
+ const b=el('confirmDirectButton');if(b)b.disabled=true;
+ try{
+  const res=await api('/api/export/confirm-available',{method:'POST',body:JSON.stringify({batch_id:preparedBatch})});
+  preparedBatch=null;closeModal(true);notify(`✅ تم تأكيد ${res.count||0} مستند فقط. أي ملفات ناقصة ستظهر لاحقًا للتنزيل.`);await refresh();
+ }catch(e){notify(e.message,true);if(b)b.disabled=false}
+}
+
 function downloadAvailableOnly(){
  if(!preparedBatch)return notify('جهّز دفعة أولًا',true);
  const path=`/api/export/batch/${encodeURIComponent(preparedBatch)}/available.zip`;
