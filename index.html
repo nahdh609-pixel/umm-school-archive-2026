@@ -78,6 +78,16 @@
  #printReport .report-table tbody tr{break-inside:avoid;page-break-inside:avoid}
  #printReport .report-foot{break-inside:avoid;page-break-inside:avoid}
 }
+
+/* V8.3: started but incomplete teacher files (1-4 documents). */
+.started-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+.started-row{border:1px solid #c9e2dc;border-radius:12px;padding:12px;margin:9px 0;background:#f7fcfa;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.started-row .started-name{font-weight:800;font-size:15px}
+.started-row .started-detail{font-size:12px;color:#546b71;line-height:1.9}
+.started-row .started-missing{font-size:12px;color:#925822}
+.started-controls{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.started-controls>button{flex:1 1 auto}
+@media(max-width:600px){.started-row{align-items:flex-start}.started-row .btn{min-width:90px}}
 </style>
 </head>
 <body>
@@ -91,7 +101,7 @@
 <input id="excel" type="file" accept=".xlsx,.csv" class="hidden" onchange="importExcel(event)">
 <script>
 let notificationItems=[],unreadNotifications=0,lastReadAt='',firstNotificationPoll=true,notificationsTimer=null,previouslyDownloaded=new Set(),exportPreview=null,preparedBatch=null;
-let user=null,csrf='',teachers=[],docs=[],logs=[],users=[],activeTab='home',pickedTeacher=null,pending=[],targetKind='',targetMode='append',targetPage=null,busy=false,searchText='',teacherFilter='all',expectedDocVersion=0,missingSearch='',missingLimit=35;
+let user=null,csrf='',teachers=[],docs=[],logs=[],users=[],activeTab='home',pickedTeacher=null,pending=[],targetKind='',targetMode='append',targetPage=null,busy=false,searchText='',teacherFilter='all',expectedDocVersion=0,missingSearch='',missingLimit=35,startedMissingSearch='',startedMissingLimit=35;
 const kinds={start:'مباشرة العمل',appointment:'قرار التعيين',birth:'شهادة الميلاد',service:'استمرارية العمل',qualification:'المؤهل العلمي'};
 const el=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -135,6 +145,59 @@ function renderMissingCards(){
  const more=el('missingMore');if(more)more.classList.toggle('hidden',missingLimit>=all.length);
 }
 function moreMissing(){missingLimit+=40;renderMissingCards()}
+
+
+/* A second, independent list: files with 1-4 saved document types only. */
+function renderStartedMissingCards(){
+ const list=el('startedMissingRows'), counter=el('startedMissingCount');
+ if(!list || user?.role!=='admin')return;
+ const q=startedMissingSearch.trim().toLowerCase();
+ const partial=teachers.filter(t=>{
+   const n=filled(t.id);
+   return n>=1&&n<=4&&(!q||`${t.full_name} ${t.national_id||''} ${t.position||''} ${missingDocs(t).join(' ')}`.toLowerCase().includes(q));
+ }).sort((a,b)=>a.full_name.localeCompare(b.full_name,'ar'));
+ counter.textContent=`معلمون بدأ تصوير ملفاتهم ولم يكتملوا: ${partial.length}`;
+ list.innerHTML=partial.slice(0,startedMissingLimit).map(t=>{
+   const count=filled(t.id);
+   return `<div class="started-row"><div><div class="started-name">${esc(t.full_name)} <span class="tag bad">${count}/5</span></div><div class="started-detail">${esc(t.position||'—')}</div><div class="started-missing">الناقص: ${esc(missingDocs(t).join('، '))}</div></div><button class="btn sm primary" type="button" onclick="tab('teachers');openTeacher('${t.id}')">فتح الملف</button></div>`;
+ }).join('')||'<p class="muted">لا يوجد معلمون بدأ تصوير ملفاتهم ولديهم نواقص مطابقون للبحث.</p>';
+ const more=el('startedMissingMore');
+ if(more) more.classList.toggle('hidden',partial.length<=startedMissingLimit);
+}
+function moreStartedMissing(){startedMissingLimit+=40;renderStartedMissingCards()}
+
+/* Fresh data at print time: 0/5 excluded and 5/5 excluded.
+   Kept independent from the existing all-missing report. */
+async function printStartedMissingReport(){
+ if(!user||user.role!=='admin') return notify('هذا الكشف للمدير فقط',true);
+ const container=el('printReport');
+ if(!container)return notify('تعذر تجهيز الكشف',true);
+ try{
+  const data=await api('/api/state');
+  const sourceTeachers=Array.isArray(data.teachers)?data.teachers:[];
+  const sourceDocs=Array.isArray(data.documents)?data.documents:[];
+  const present=new Set(sourceDocs.map(d=>`${d.teacher_id}:${d.kind}`));
+  const rows=sourceTeachers.map(t=>{
+    const missing=Object.entries(kinds).filter(([kind])=>!present.has(`${t.id}:${kind}`)).map(([,label])=>label);
+    return {t,missing,count:5-missing.length};
+  }).filter(x=>x.count>=1&&x.count<=4).sort((a,b)=>a.t.full_name.localeCompare(b.t.full_name,'ar'));
+  const stamp=new Date().toLocaleString('ar-LY',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+  const body=rows.map((x,i)=>`<tr><td>${i+1}</td><td>${esc(x.t.full_name)}</td><td>${esc(x.t.position||'—')}</td><td>${x.count}/5</td><td>${esc(x.missing.join('، '))}</td></tr>`).join('');
+  container.innerHTML=`
+   <div class="report-school">مدرسة أم المؤمنين للتعليم الأساسي</div>
+   <div class="report-title">كشف المعلمين الذين بدأ تصوير ملفاتهم ولم تكتمل</div>
+   <p class="report-subtitle">المعلمون الذين لديهم من 1 إلى 4 مستندات محفوظة (مع استبعاد 0/5 و5/5)</p>
+   <div class="report-meta"><span>تاريخ الطباعة: ${esc(stamp)}</span><span>عدد المعلمين في الكشف: ${rows.length}</span></div>
+   <table class="report-table">
+    <colgroup><col style="width:7%"><col style="width:31%"><col style="width:17%"><col style="width:10%"><col style="width:35%"></colgroup>
+    <thead><tr><th>م</th><th>اسم المعلم</th><th>الوظيفة</th><th>الموجود</th><th>المستندات الناقصة</th></tr></thead>
+    <tbody>${body||'<tr><td colspan="5" style="text-align:center">لا توجد حاليًا ملفات بدأ تصويرها وما زالت ناقصة.</td></tr>'}</tbody>
+   </table>
+   <p class="report-foot">المسوغات الخمسة المطلوبة: مباشرة العمل، قرار التعيين، شهادة الميلاد، استمرارية العمل، المؤهل العلمي.</p>`;
+  window.print();
+ }catch(err){notify('تعذر طباعة كشف الملفات الناقصة قيد التصوير: '+err.message,true)}
+}
+
 
 /* Manager-only report. Fetch fresh server state so scans saved on other devices
    are reflected immediately rather than printing a stale browser list. */
@@ -189,10 +252,21 @@ function renderHome(){
  <input class="search" id="missingSearchInput" placeholder="ابحث في جميع المعلمين الناقصين..." value="${esc(missingSearch)}" oninput="missingSearch=this.value;missingLimit=35;renderMissingCards()"></div>
  <p class="muted small" id="missingCount"></p><div id="missingRows"></div>
  <button id="missingMore" class="btn secondary full" onclick="moreMissing()">عرض المزيد من المعلمين الناقصين</button></div>
+ <div class="card" id="startedMissingCard">
+  <div class="started-head"><h3 style="margin:0">📂 كشف الملفات التي بدأ تصويرها ولم تكتمل (1–4 من 5)</h3>
+   <button type="button" class="btn dark" onclick="printStartedMissingReport()">🖨️ طباعة كشف الملفات الناقصة قيد التصوير</button></div>
+  <p class="small muted">يُظهر فقط المعلمين الذين حُفظ لهم مستند واحد على الأقل ولم يصلوا إلى 5/5. لا يشمل ملفات 0/5 ولا الملفات المكتملة.</p>
+  <div class="field"><label for="startedMissingSearchInput">ابحث باسم المعلم أو رقمه الوطني أو المستند الناقص</label>
+   <input class="search" id="startedMissingSearchInput" placeholder="بحث في الملفات التي بدأ تصويرها..." value="${esc(startedMissingSearch)}" oninput="startedMissingSearch=this.value;startedMissingLimit=35;renderStartedMissingCards()"></div>
+  <p class="muted small" id="startedMissingCount"></p>
+  <div id="startedMissingRows"></div>
+  <button type="button" id="startedMissingMore" class="btn secondary full" onclick="moreStartedMissing()">عرض المزيد</button>
+ </div>
  <div class="grid2"><div class="card"><h3>📷 التصوير السريع</h3><p class="muted">اختر المعلم ثم صور المستند الناقص.</p>
  <button class="btn primary" onclick="tab('teachers')">فتح قائمة المعلمين</button></div>
  <div class="card"><h3>🕓 آخر عمليات المستخدمين — اسم المعلم واضح</h3>${latest}</div></div>`;
  renderMissingCards();
+ renderStartedMissingCards();
 }
 
 function startNotificationPolling(){
