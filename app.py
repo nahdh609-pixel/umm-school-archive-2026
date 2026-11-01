@@ -3,6 +3,7 @@ import csv
 import hashlib
 import io
 import tempfile
+import httpx
 import zipfile
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -112,10 +113,24 @@ def uid(value):
         raise UserError("معرّف غير صحيح")
 
 
+def read_with_retry(fn, attempts=3):
+    """Retry SELECT requests only. Never blindly repeat writes."""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except (httpx.TransportError, TimeoutError, OSError) as exc:
+            app.logger.warning("Temporary Supabase read transport error: %s (%s/%s)",
+                               type(exc).__name__, attempt + 1, attempts)
+            if attempt == attempts - 1:
+                raise UserError("تعذر الاتصال بالتخزين مؤقتًا. لم تُحذف البيانات؛ أعد المحاولة.", 503) from exc
+            time.sleep((0.35, 1.0, 2.0)[min(attempt, 2)])
+
+
 def all_records(name, fields="*", order="created_at"):
     result = []
     for offset in range(0, 10000, 500):
-        part = table(name).select(fields).order(order).range(offset, offset + 499).execute().data or []
+        part = read_with_retry(lambda: table(name).select(fields).order(order).range(
+            offset, offset + 499).execute()).data or []
         result.extend(part)
         if len(part) < 500:
             break
@@ -129,7 +144,7 @@ def login_required(roles=None):
             user_id = session.get("uid")
             if not user_id:
                 raise UserError("سجّل الدخول أولًا", 401)
-            users = table("users").select("id,username,full_name,role,active").eq("id", user_id).limit(1).execute().data
+            users = read_with_retry(lambda: table("users").select("id,username,full_name,role,active").eq("id", user_id).limit(1).execute()).data
             if not users or not users[0]["active"]:
                 session.clear()
                 raise UserError("الحساب غير نشط", 401)
@@ -264,13 +279,13 @@ def state():
     logs = []
     users = []
     if role == "admin":
-        logs = table("logs").select("actor_name,action,details,created_at").order("created_at", desc=True).limit(30).execute().data or []
-        users = table("users").select("id,username,full_name,role,active,created_at").order("created_at").execute().data or []
+        logs = read_with_retry(lambda: table("logs").select("actor_name,action,details,created_at").order("created_at", desc=True).limit(30).execute()).data or []
+        users = read_with_retry(lambda: table("users").select("id,username,full_name,role,active,created_at").order("created_at").execute()).data or []
     return jsonify(teachers=teachers, documents=docs, logs=logs, users=users)
 
 
 def teacher_by_id(id_):
-    rows = table("teachers").select("*").eq("id", uid(id_)).limit(1).execute().data or []
+    rows = read_with_retry(lambda: table("teachers").select("*").eq("id", uid(id_)).limit(1).execute()).data or []
     if not rows:
         raise UserError("لم يتم العثور على المعلم", 404)
     return rows[0]
@@ -392,12 +407,12 @@ def storage():
 def find_doc(teacher_id, kind):
     if kind not in KINDS:
         raise UserError("نوع المستند غير معروف")
-    found = table("documents").select("*").eq("teacher_id", uid(teacher_id)).eq("kind", kind).limit(1).execute().data or []
+    found = read_with_retry(lambda: table("documents").select("*").eq("teacher_id", uid(teacher_id)).eq("kind", kind).limit(1).execute()).data or []
     return found[0] if found else None
 
 
 def get_doc(id_):
-    found = table("documents").select("*").eq("id", uid(id_)).limit(1).execute().data or []
+    found = read_with_retry(lambda: table("documents").select("*").eq("id", uid(id_)).limit(1).execute()).data or []
     if not found:
         raise UserError("المستند غير موجود", 404)
     return found[0]
@@ -646,6 +661,31 @@ def merge_pdfs(existing_pdf, new_pdf, mode, page_index=None):
 def save_doc(teacher_id, kind, contents, pages, old=None):
     path = f"{uid(teacher_id)}/{kind}/{uuid4().hex}.pdf"
     storage().upload(path, contents, {"content-type": "application/pdf", "upsert": "false"})
+    # Verify new bytes are reachable BEFORE pointing the database at this path.
+    # Keep the uploaded object on failure for later recovery; never delete user scans.
+    try:
+        check = None
+        for attempt in range(3):
+            try:
+                check = _direct_private_pdf(path)
+                break
+            except StorageFetchError as exc:
+                # The SDK offers a second authenticated route if direct GET
+                # is unavailable on this Supabase Storage deployment.
+                try:
+                    check = storage().download(path)
+                    if isinstance(check, bytes) and check.startswith(b"%PDF"):
+                        break
+                except Exception:
+                    pass
+                if attempt == 2:
+                    raise UserError("تم رفع PDF لكن تعذر التحقق من وصوله للتخزين. احتفظ بالصورة وأعد المحاولة؛ لن تُستبدل النسخة الحالية.", 503) from exc
+                time.sleep((0.35, 1.0)[attempt])
+        if check is None or hashlib.sha256(check).digest() != hashlib.sha256(contents).digest():
+            raise UserError("النسخة المرفوعة لا تطابق المستند؛ لم نغيّر الملف القديم.", 503)
+    except UserError:
+        app.logger.error("Upload not verified, original database reference retained: %s", path)
+        raise
     try:
         if old:
             resp = table("documents").update({
@@ -661,10 +701,9 @@ def save_doc(teacher_id, kind, contents, pages, old=None):
                 "version": 1, "storage_path": path, "uploaded_by": session.get("uid"),
             }).execute()
     except Exception:
-        try:
-            storage().remove([path])
-        except Exception:
-            app.logger.exception("Failed to remove unsaved PDF")
+        # Never remove a freshly uploaded file after a database conflict.
+        # It can contain the only recoverable scan if a request is interrupted.
+        app.logger.warning("Uploaded PDF retained for recovery after DB write conflict: %s", path)
         # Two authorized devices may scan the same missing document at once.
         # Preserve the first save and ask the second device to refresh, instead
         # of presenting a generic internal error or replacing another scan.
@@ -677,12 +716,19 @@ def save_doc(teacher_id, kind, contents, pages, old=None):
             except Exception:
                 app.logger.warning("Could not verify simultaneous upload", exc_info=True)
         raise
-    if old:
-        try:
-            storage().remove([old["storage_path"]])
-        except Exception:
-            app.logger.exception("Old PDF cleanup failed")
+    # Critical data-safety policy: NEVER auto-delete an older PDF version.
+    # Versions live under teacher_id/kind and can recover missing references.
     return resp.data[0]
+
+
+def safe_doc_pdf(doc):
+    """Read the newest recoverable PDF for the SAME teacher and document type."""
+    data, resolved = _export_pdf_with_retries({
+        "kind": doc["kind"], "path": doc["storage_path"],
+        "version": int(doc.get("version") or 1),
+        "pages": int(doc.get("pages") or 0),
+    }, "مستند المعلم", doc["teacher_id"])
+    return data, resolved
 
 
 @app.post("/api/teachers/<teacher_id>/documents/<kind>")
@@ -726,7 +772,7 @@ def upload_doc(teacher_id, kind):
                 raise UserError("المستند حُذف من جهاز آخر. حدّث قائمة المعلمين.", 409)
         final = new_pdf
         if current and mode == "append":
-            final = merge_pdfs(storage().download(current["storage_path"]), new_pdf, "append")
+            final = merge_pdfs(safe_doc_pdf(current)[0], new_pdf, "append")
         page_count = (current["pages"] if current and mode == "append" else 0) + len(files)
         try:
             saved = save_doc(teacher_id, kind, final, page_count, current)
@@ -750,7 +796,7 @@ def replace_page(doc_id, page):
     if len(imgs) != 1:
         raise UserError("اختَر صورة واحدة للاستبدال")
     pdf, cropped = images_as_pdf(imgs, request.form.get("quality", "scan"), request.form.get("crop_points"))
-    updated = merge_pdfs(storage().download(doc["storage_path"]), pdf, "replace_page", page)
+    updated = merge_pdfs(safe_doc_pdf(doc)[0], pdf, "replace_page", page)
     saved = save_doc(doc["teacher_id"], doc["kind"], updated, doc["pages"], doc)
     audit_document("استبدال صفحة", doc, f"صفحة {page+1}")
     return jsonify(document=saved, auto_crop_count=cropped)
@@ -762,7 +808,7 @@ def remove_page(doc_id, page):
     doc = get_doc(doc_id)
     require_document_editor(doc)
     check_document_version(doc, request.args.get("expected_version"), required=True)
-    old = PdfReader(io.BytesIO(storage().download(doc["storage_path"])))
+    old = PdfReader(io.BytesIO(safe_doc_pdf(doc)[0]))
     if len(old.pages) < 2:
         raise UserError("هذه آخر صفحة؛ استخدم زر حذف المستند كاملًا")
     if not 0 <= page < len(old.pages):
@@ -803,7 +849,7 @@ def enhance_existing_pdf(doc_id):
     require_document_editor(doc)
     check_document_version(doc, (request.get_json(silent=True) or {}).get("expected_version"), required=True)
     # Existing archived documents in this application are one raster image per PDF page.
-    old_pdf = storage().download(doc["storage_path"])
+    old_pdf = safe_doc_pdf(doc)[0]
     pdf = PdfReader(io.BytesIO(old_pdf))
     if not 1 <= len(pdf.pages) <= 20:
         raise UserError("ملفات PDF الكبيرة تحتاج إعادة تصوير على دفعات")
@@ -822,6 +868,38 @@ def enhance_existing_pdf(doc_id):
     return jsonify(document=saved)
 
 
+@app.post("/api/documents/<doc_id>/restore-pdf")
+@login_required(roles=("admin",))
+def restore_pdf_from_saved_file(doc_id):
+    """Restore a real PDF already downloaded on the phone: no rescanning.
+
+    The admin explicitly chooses a PDF from their phone; the active document
+    remains untouched until the replacement has been uploaded AND verified.
+    """
+    doc = get_doc(doc_id)
+    check_document_version(doc, request.form.get("expected_version"), required=True)
+    file = request.files.get("file")
+    if not file or not file.filename.lower().endswith(".pdf"):
+        raise UserError("اختر ملف PDF محفوظًا لهذا المعلم من هاتفك.", 422)
+    data = file.read(30 * 1024 * 1024 + 1)
+    if len(data) > 30 * 1024 * 1024 or len(data) < 50 or not data.startswith(b"%PDF"):
+        raise UserError("ملف PDF غير صالح أو يتجاوز 30 ميغابايت.", 422)
+    try:
+        reader = PdfReader(io.BytesIO(data), strict=False)
+        if reader.is_encrypted:
+            raise UserError("ملف PDF محمي بكلمة مرور. افتح نسخة غير محمية ثم ارفعها.", 422)
+        pages = len(reader.pages)
+        if not 1 <= pages <= 50:
+            raise UserError("ملف PDF يجب أن يحتوي على 1 إلى 50 صفحة.", 422)
+    except UserError:
+        raise
+    except Exception as exc:
+        raise UserError("تعذر قراءة PDF المختار. تحقق من سلامته.", 422) from exc
+    saved = save_doc(doc["teacher_id"], doc["kind"], data, pages, doc)
+    audit_document("استرجاع PDF", doc, f"رفع ملف PDF موجود في الهاتف، عدد الصفحات: {pages}")
+    return jsonify(document=saved, pages=pages)
+
+
 @app.get("/api/documents/<doc_id>/pdf")
 @login_required(roles=("admin", "viewer", "scanner"))
 def download_doc(doc_id):
@@ -829,9 +907,12 @@ def download_doc(doc_id):
     if request.current_user["role"] == "scanner":
         require_document_editor(doc)
     teacher = teacher_by_id(doc["teacher_id"])
-    data = storage().download(doc["storage_path"])
+    data, resolved = safe_doc_pdf(doc)
     name = f"{clean(teacher['full_name'])}-{clean(KINDS[doc['kind']])}.pdf"
-    return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=request.args.get("download") == "1", download_name=name)
+    response = send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=request.args.get("download") == "1", download_name=name)
+    if resolved.get("backup_recovery"):
+        response.headers["X-Archive-Recovery"] = "backup"
+    return response
 
 
 @app.get("/api/teachers/<teacher_id>/combined.pdf")
@@ -846,7 +927,7 @@ def combined_pdf(teacher_id):
     for kind in KINDS:
         doc = by_kind.get(kind)
         if doc:
-            writer.append(io.BytesIO(storage().download(doc["storage_path"])))
+            writer.append(io.BytesIO(safe_doc_pdf(doc)[0]))
     out = io.BytesIO()
     writer.write(out)
     return send_file(io.BytesIO(out.getvalue()), mimetype="application/pdf", as_attachment=True,
@@ -858,7 +939,7 @@ def archive_stream(teachers, output_format="folders"):
     if output_format not in ("folders", "pdf"):
         raise UserError("صيغة التصدير غير صحيحة")
     zs = ZipStream(compress_type=ZIP_STORED)
-    doc_rows = all_records("documents", "teacher_id,kind,storage_path")
+    doc_rows = all_records("documents", "teacher_id,kind,storage_path,version,pages")
     grouped = {}
     for row in doc_rows:
         grouped.setdefault(row["teacher_id"], {})[row["kind"]] = row
@@ -872,7 +953,7 @@ def archive_stream(teachers, output_format="folders"):
                 writer = PdfWriter()
                 for kind in KINDS:
                     if kind in by_kind:
-                        writer.append(io.BytesIO(storage().download(by_kind[kind]["storage_path"])))
+                        writer.append(io.BytesIO(safe_doc_pdf(by_kind[kind])[0]))
                 output = io.BytesIO()
                 writer.write(output)
                 contents = output.getvalue()
@@ -885,9 +966,8 @@ def archive_stream(teachers, output_format="folders"):
                 if not doc:
                     continue
                 entry = f"{label}/{clean(KINDS[kind])}.pdf"
-                path = doc["storage_path"]
-                def load_chunks(path=path):
-                    contents = storage().download(path)
+                def load_chunks(doc=doc):
+                    contents = safe_doc_pdf(doc)[0]
                     for ix in range(0, len(contents), 65536):
                         yield contents[ix:ix+65536]
                 zs.add(load_chunks(), entry)
@@ -1129,6 +1209,53 @@ def _direct_private_pdf(path):
         raise StorageFetchError(None, type(exc).__name__) from exc
 
 
+def _find_backup_pdf(teacher_id, kind, missing_path, expected_pages=0):
+    """Look for intact older PDFs under the same teacher/type ONLY.
+
+    A path may be missing because old save_doc versions deleted files on edit.
+    We verify PDF structure and page count, and only silently pick an exact
+    page-count match. Different-page candidates require human review.
+    """
+    prefix = f"{uid(teacher_id)}/{kind}"
+    candidates = []
+    try:
+        for offset in (0, 100, 200):
+            rows = read_with_retry(lambda: storage().list(prefix, {
+                "limit": 100, "offset": offset,
+                "sortBy": {"column": "created_at", "order": "desc"},
+            })) or []
+            for obj in rows:
+                name = obj.get("name") or ""
+                if name.lower().endswith(".pdf") and "/" not in name:
+                    path = prefix + "/" + name
+                    if path != missing_path:
+                        candidates.append((obj.get("created_at") or "", path))
+            if len(rows) < 100:
+                break
+    except Exception as exc:
+        app.logger.warning("Backup scan inaccessible for %s/%s: %s", teacher_id, kind, type(exc).__name__)
+        return None, None, []
+    candidates.sort(reverse=True)
+    alternate_page_counts = []
+    for _, path in candidates[:60]:
+        try:
+            try:
+                blob = _direct_private_pdf(path)
+            except StorageFetchError:
+                blob = storage().download(path)
+            reader = PdfReader(io.BytesIO(blob), strict=False)
+            count = len(reader.pages)
+            if not count:
+                continue
+            if expected_pages and count != expected_pages:
+                alternate_page_counts.append(count)
+                continue
+            return blob, path, alternate_page_counts
+        except Exception:
+            continue
+    return None, None, alternate_page_counts
+
+
 def _export_pdf_with_retries(item, teacher_name, teacher_id):
     """Resolve edited PDF paths, retry genuine temporary errors and never drop PDFs.
 
@@ -1170,10 +1297,24 @@ def _export_pdf_with_retries(item, teacher_name, teacher_id):
                             return blob, selected
                     except Exception:
                         app.logger.info("SDK fallback could not read teacher=%s kind=%s", teacher_id, kind)
+                expected_pages = int(selected.get("pages") or 0)
+                backup, fallback_path, other_counts = _find_backup_pdf(
+                    teacher_id, kind, selected["path"], expected_pages)
+                if backup is not None:
+                    app.logger.warning("Recoverable PDF backup used: teacher=%s kind=%s", teacher_id, kind)
+                    selected["path"] = fallback_path
+                    selected["backup_recovery"] = True
+                    selected["pages"] = len(PdfReader(io.BytesIO(backup)).pages)
+                    return backup, selected
+                if other_counts:
+                    raise UserError(
+                        f"المسار الحالي لـ{title} للمعلم {teacher_name} مفقود، "
+                        f"وُجدت نسخ مختلفة بعدد صفحات {sorted(set(other_counts))}. "
+                        "يجب مراجعتها قبل استبدال مرجع المستند؛ لا تعِد التصوير الآن.", 409) from exc
                 raise UserError(
-                    f"تعذّر الوصول إلى {title} للمعلم {teacher_name} (رمز {exc.code}). "
-                    "المسار الحالي غير متاح من تخزين Supabase؛ افحص عرض PDF لهذا المستند. "
-                    "لم يتم حذف أي ملف أو إرسال ZIP ناقص.", 503) from exc
+                    f"تعذّر العثور على PDF {title} للمعلم {teacher_name} (404). "
+                    "فُحص مجلد المستند ولم تُعثر نسخة سليمة بنفس عدد الصفحات. "
+                    "الملفات الأخرى ما زالت محفوظة؛ لا تعد التصوير حتى نفحص تخزين Supabase.", 503) from exc
             if attempt == 5:
                 break
             time.sleep((0.4, 0.9, 1.7, 3.3, 5.5)[attempt])
@@ -1194,11 +1335,11 @@ def _build_complete_export(batch, teacher_lookup):
     num_files = 0
     resolved_payload = []
     try:
-        latest_documents = all_records("documents", "teacher_id,kind,storage_path,version", "created_at")
+        latest_documents = all_records("documents", "teacher_id,kind,storage_path,version,pages", "created_at")
         latest_index = {(d["teacher_id"], d["kind"]): d for d in latest_documents}
         manifest = io.StringIO()
         csv_writer = csv.writer(manifest)
-        csv_writer.writerow(["اسم المعلم", "اسم المستند", "عدد المستندات في الدفعة"])
+        csv_writer.writerow(["اسم المعلم", "اسم المستند", "عدد المستندات في الدفعة", "مصدر النسخة"])
         with zipfile.ZipFile(handle, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
             for row in payload:
                 teacher = teacher_lookup.get(row["id"])
@@ -1217,7 +1358,7 @@ def _build_complete_export(batch, teacher_lookup):
                             f"مستند {KINDS.get(f['kind'],f['kind'])} للمعلم "
                             f"{teacher['full_name']} حُذف بعد تجهيز الدفعة. أعد تجهيزها.", 409)
                     files.append({"kind": f["kind"], "path": current["storage_path"],
-                                  "version": int(current.get("version") or 1)})
+                                  "version": int(current.get("version") or 1), "pages": int(current.get("pages") or 0)})
                 label = f"{clean(teacher['full_name'])}_{clean(teacher['national_id'][-4:])}_{teacher['id'][:6]}"
                 resolved_files = []
                 if batch["output_format"] == "pdf":
@@ -1226,7 +1367,8 @@ def _build_complete_export(batch, teacher_lookup):
                         pdf_bytes, resolved = _export_pdf_with_retries(item, teacher["full_name"], row["id"])
                         writer.append(io.BytesIO(pdf_bytes))
                         resolved_files.append(resolved)
-                        csv_writer.writerow([teacher["full_name"], KINDS[resolved["kind"]], len(files)])
+                        csv_writer.writerow([teacher["full_name"], KINDS[resolved["kind"]], len(files),
+                                             "نسخة احتياطية مسترجعة - راجع المستند" if resolved.get("backup_recovery") else "النسخة الحالية"])
                     merged = io.BytesIO()
                     writer.write(merged)
                     archive.writestr(f"{label}.pdf", merged.getvalue())
@@ -1237,7 +1379,8 @@ def _build_complete_export(batch, teacher_lookup):
                         entry = f"{label}/{clean(KINDS[resolved['kind']])}.pdf"
                         archive.writestr(entry, pdf_bytes)
                         resolved_files.append(resolved)
-                        csv_writer.writerow([teacher["full_name"], KINDS[resolved["kind"]], len(files)])
+                        csv_writer.writerow([teacher["full_name"], KINDS[resolved["kind"]], len(files),
+                                             "نسخة احتياطية مسترجعة - راجع المستند" if resolved.get("backup_recovery") else "النسخة الحالية"])
                         num_files += 1
                 # Exactly what was sent is recorded; freshly scanned versions
                 # remain detected as 'updated' if not included in this ZIP.
@@ -1266,6 +1409,69 @@ def _build_complete_export(batch, teacher_lookup):
     except Exception:
         handle.close()
         raise
+
+
+@app.post("/api/archive/repair")
+@login_required(roles=("admin",))
+def repair_archive_links():
+    """Admin-triggered, bounded repair from REAL existing PDFs, no SQL migration.
+
+    Checks the actual storage bytes. If the current PDF is absent but a
+    readable older PDF of the SAME teacher/type and page count exists, fix
+    the reference using an optimistic version check. Never fabricate pages.
+    """
+    body = request.get_json(silent=True) or {}
+    try:
+        start = max(0, int(body.get("start", 0)))
+        count = max(1, min(10, int(body.get("count", 10))))
+    except (ValueError, TypeError):
+        raise UserError("حدود الفحص غير صحيحة", 422)
+    docs = all_records("documents", "id,teacher_id,kind,storage_path,version,pages", "created_at")
+    by_id = {t["id"]: t["full_name"] for t in all_records("teachers", "id,full_name", "created_at")}
+    checked = repaired = ok = 0
+    issues = []
+    for doc in docs[start:start + count]:
+        checked += 1
+        label = by_id.get(doc["teacher_id"], "معلم غير معروف")
+        kind_label = KINDS.get(doc["kind"], doc["kind"])
+        try:
+            blob, selected = _export_pdf_with_retries({
+                "kind": doc["kind"], "path": doc["storage_path"],
+                "version": int(doc.get("version") or 1),
+                "pages": int(doc.get("pages") or 0),
+            }, label, doc["teacher_id"])
+            if not selected.get("backup_recovery"):
+                ok += 1
+                continue
+            # Never silently downgrade documents to a different page count.
+            recovered_pages = len(PdfReader(io.BytesIO(blob), strict=False).pages)
+            if recovered_pages != doc["pages"]:
+                issues.append({"name": label, "kind": kind_label,
+                               "reason": "عدد صفحات النسخة البديلة مختلف؛ يحتاج مراجعة"})
+                continue
+            response = (table("documents").update({
+                "storage_path": selected["path"],
+                "version": int(doc["version"]) + 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", doc["id"]).eq("version", doc["version"])
+                .eq("storage_path", doc["storage_path"]).execute())
+            if not response.data:
+                issues.append({"name": label, "kind": kind_label,
+                               "reason": "جرى تعديل المستند بالتزامن؛ أعد فحصه"})
+                continue
+            audit_document("استرجاع PDF", doc,
+                           "تم الربط بنسخة موجودة وسليمة بنفس عدد الصفحات؛ المسار السابق محفوظ بسجل الخادم")
+            app.logger.warning("Repaired PDF pointer: doc=%s old=%s new=%s",
+                               doc["id"], doc["storage_path"], selected["path"])
+            repaired += 1
+        except UserError as exc:
+            issues.append({"name": label, "kind": kind_label, "reason": exc.message})
+        except Exception as exc:
+            app.logger.exception("Archive repair check failed: doc=%s", doc["id"])
+            issues.append({"name": label, "kind": kind_label,
+                           "reason": "تعذّر الاتصال بخدمة التخزين؛ أعد محاولة الفحص"})
+    return jsonify(total=len(docs), start=start, checked=checked,
+                   healthy=ok, repaired=repaired, issues=issues)
 
 
 @app.get("/api/export/batch/<batch_id>.zip")
@@ -1424,7 +1630,7 @@ def reset_export_for_missing_phone_files():
 # V8 notification center: audit data + account-level read pointer, no public document URLs.
 DOCUMENT_EVENT_ACTIONS = (
     "تصوير مستند", "تعديل مستند", "استبدال صفحة", "حذف صفحة",
-    "حذف مستند", "تحسين وضوح PDF",
+    "حذف مستند", "تحسين وضوح PDF", "استرجاع PDF",
 )
 
 
