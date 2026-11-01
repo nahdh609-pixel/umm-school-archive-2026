@@ -42,10 +42,10 @@
 .event-card.unread{background:#f3fbfa;border-right-color:#d5892f}.doc.focus-doc{outline:3px solid #0b9c96;box-shadow:0 4px 18px #0b9c9630}
 .event-title{font-weight:800;font-size:16px;margin-bottom:3px}
 .event-meta{font-size:12px;color:#617484;margin-bottom:8px}
-.export-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:10px 0 14px}
-.export-metric{padding:11px 9px;background:#f2f7fa;border-radius:10px;border:1px solid #e0e9ed;text-align:center}
+.export-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin:10px 0 14px}
+.export-metric{padding:11px 5px;background:#f2f7fa;border-radius:10px;border:1px solid #e0e9ed;text-align:center;cursor:pointer;color:var(--text)}.export-metric:focus-visible{outline:3px solid var(--teal);outline-offset:2px}.export-metric:hover{background:#e1f5f2}
 .export-metric b{display:block;font-size:22px;color:#173854}
-.export-metric span{font-size:12px;color:#617484}
+.export-metric span{font-size:11px;color:#617484;display:block}
 .batch-note{padding:12px;border:1px solid #badbd6;background:#eff9f6;border-radius:12px;margin:12px 0}
 .previous-select{max-height:320px;overflow-y:auto;border:1px solid #dfe7ec;border-radius:10px;padding:8px;background:#fbfdff}
 .previous-select label{display:flex;gap:9px;align-items:center;border-bottom:1px solid #edf0f3;padding:10px 6px;cursor:pointer}
@@ -613,7 +613,13 @@ function renderExports(){
  <div class="field"><label>ما الذي تريد تنزيله؟</label><select id="zipSelection" onchange="previewExport()"><option value="pending" selected>الجديد والمحدّث فقط (بدون تكرار)</option><option value="additions">🧩 استكمال النواقص — المصوغات المضافة لاحقًا فقط</option><option value="all">الكل، حتى ما نزلته سابقًا</option><option value="new">الجديد فقط</option><option value="updated">المحدّث فقط</option><option value="previous">سبق تنزيله فقط (بدون تغيير)</option></select></div>
  <div class="field"><label>عدد المعلمين في الدفعة</label><select id="zipCount"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="400">حتى 400</option></select></div>
  <div class="field"><label>بداية الدفعة ضمن القائمة المختارة</label><input id="zipStart" type="number" value="1" min="1"></div></div>
- <div class="export-metrics"><div class="export-metric"><b id="exportNew">—</b><span>جديد</span></div><div class="export-metric"><b id="exportUpdated">—</b><span>محدّث</span></div><div class="export-metric"><b id="exportOld">—</b><span>سبق تنزيله</span></div></div>
+ <div class="export-metrics">
+  <button type="button" class="export-metric" onclick="showExportMetric('new')" title="اعرض أسماء المعلمين الجدد"><b id="exportNew">—</b><span>جديد</span></button>
+  <button type="button" class="export-metric" onclick="showExportMetric('updated')" title="اعرض ملفات المعلمين المعدلة"><b id="exportUpdated">—</b><span>محدّث</span></button>
+  <button type="button" class="export-metric" onclick="showExportMetric('previous')" title="اعرض ملفات المعلمين السابق تنزيلها"><b id="exportOld">—</b><span>سبق تنزيله</span></button>
+  <button type="button" class="export-metric" onclick="showExportMetric('additions')" title="اعرض المستندات المضافة لاحقًا"><b id="exportAdditions">—</b><span>استكمال النواقص</span></button>
+ </div>
+ <p class="small muted">اضغط على أي رقم لعرض الأسماء والمستندات، مع البحث وفتح الملف. قد يظهر المعلم في «محدّث» و«استكمال النواقص» معًا.</p>
  <div class="batch-note" style="background:#eef6fb;border-color:#c9dbe8">🧩 <b>استكمال النواقص:</b> <b id="addedTeachers">—</b> معلم لديه <b id="addedDocuments">—</b> مستند جديد أُضيف بعد آخر تنزيل مؤكد. سيُنزل هذا المستند الجديد فقط داخل مجلد باسم المعلم، ولا يعيد مستنداته القديمة.</div>
  <p id="exportHint" class="small muted">جارٍ فحص الملفات…</p>
  <button class="btn secondary full" type="button" onclick="chooseExportAdditions()">🧩 زر استكمال النواقص — تنزيل المستندات المضافة لاحقًا فقط</button>
@@ -622,6 +628,42 @@ function renderExports(){
  <button class="btn sm secondary" onclick="markPreviousModal()">لدي ملفات نزلتها قبل هذا التحديث — تسجيلها</button>
  <button class="btn sm outline" onclick="resetPreviousModal()">ملفات مسجلة كمنزّلة لكنها لم تصل إلى الهاتف — إعادة تعيينها</button>
  </div>`;
+ previewExport();
+}
+let activeExportMetric='new';
+function exportMetricItems(which){
+ if(!exportPreview?.items)return [];
+ return exportPreview.items.filter(x=>which==='additions'?x.additions_count>0:x.download_state===which);
+}
+function showExportMetric(which){
+ if(!['new','updated','previous','additions'].includes(which))return;
+ if(!exportPreview?.items)return notify('لم تُحمّل بيانات التصدير بعد؛ حاول بعد ظهور العدادات.',true);
+ activeExportMetric=which;
+ const titles={new:'جديد — ملفات المعلمين',updated:'محدّث — ملفات تغيّرت',previous:'سبق تنزيله — ملفات محفوظة',additions:'استكمال النواقص — مستندات مضافة لاحقًا'};
+ showModal('📋 '+titles[which],`<p class="muted">اضغط «فتح الملف» للانتقال إلى مستندات المعلم، أو اختر تنزيل هذه الفئة من الأسفل.</p>
+ <div class="field"><label for="exportMetricSearch">ابحث عن المعلم</label><input id="exportMetricSearch" class="search" oninput="renderExportMetricDetails()" placeholder="اكتب اسم المعلم"></div>
+ <div id="exportMetricTotal" class="small muted"></div><div id="exportMetricRows" style="max-height:49vh;overflow:auto"></div>
+ <button class="btn secondary full" onclick="pickExportMetricSelection()">اختيار هذه الفئة للتنزيل</button>`);
+ renderExportMetricDetails();
+}
+function renderExportMetricDetails(){
+ const target=el('exportMetricRows');if(!target)return;
+ const q=(el('exportMetricSearch')?.value||'').trim().toLowerCase();
+ const all=exportMetricItems(activeExportMetric), shown=all.filter(x=>`${x.name} ${x.missing?.join(' ')||''}`.toLowerCase().includes(q));
+ el('exportMetricTotal').textContent=`عدد المعلمين في هذا القسم: ${all.length} | نتائج البحث: ${shown.length}`;
+ target.innerHTML=shown.map(x=>{
+  const kindNames=(x.additions||[]).map(k=>kinds[k]||k);
+  const detail=activeExportMetric==='additions'
+    ? `المسوغات المضافة: ${esc(kindNames.join('، ')||'—')}`
+    : `المستندات الموجودة: ${Number(x.document_count)||0}/5 • الناقص: ${esc((x.missing||[]).join('، ')||'لا شيء')}`;
+  return `<div class="missing-row"><div><b>${esc(x.name)}</b><div class="small muted">${detail}</div>${activeExportMetric==='updated'&&kindNames.length?`<div class="small ok">استكمال النواقص: ${esc(kindNames.join('، '))}</div>`:''}</div><button type="button" class="btn sm primary" onclick="closeModal(true);tab('teachers');openTeacher('${x.id}')">فتح الملف</button></div>`;
+ }).join('')||'<p class="muted">لا توجد ملفات مطابقة للبحث.</p>';
+}
+function pickExportMetricSelection(){
+ const which=activeExportMetric;
+ closeModal(true);
+ if(el('zipSelection'))el('zipSelection').value=which;
+ if(which==='additions'&&el('zipFormat'))el('zipFormat').value='folders';
  previewExport();
 }
 function chooseExportAdditions(){
@@ -640,10 +682,11 @@ async function previewExport(){
  const format=formatNode?.value||'folders';
  try{
   const data=await api(`/api/export/preview?status=${encodeURIComponent(status)}&format=${encodeURIComponent(format)}`);
-  if(activeTab!=='exports'||el('zipStatus')?.value!==status||el('zipFormat')?.value!==format)return;
+  if(activeTab!=='exports'||el('zipStatus')?.value!==status||el('zipFormat')?.value!==format||el('zipSelection')?.value!==selection)return;
   exportPreview=data;
   el('exportNew').textContent=data.summary.new;el('exportUpdated').textContent=data.summary.updated;el('exportOld').textContent=data.summary.previous;
   el('addedTeachers').textContent=data.summary.additions_teachers||0;
+  el('exportAdditions').textContent=data.summary.additions_teachers||0;
   el('addedDocuments').textContent=data.summary.additions_documents||0;
   const eligible=data.items.filter(x=>selection==='all'||
      (selection==='pending'&&x.download_state!=='previous')||
@@ -709,7 +752,7 @@ async function downloadPrepared(){
   if(el('confirmZipDownload'))el('confirmZipDownload').disabled=false;
   if(message)message.textContent=`✅ تم التحقق من ZIP: ${preparedExpectedCount} معلم، ${expectedEntries-1} ملف PDF، وحجمه ${(blob.size/1024/1024).toFixed(2)} MB. افتح الملف وتأكد من وصوله قبل التأكيد.`;
   notify(`تم تجهيز ZIP كاملًا لعدد ${preparedExpectedCount} معلم. افحصه داخل الهاتف قبل التأكيد.`);
- }catch(e){downloadValidated=false;if(message)message.textContent='❌ '+e.message;notify(e.message,true)}
+ }catch(e){downloadValidated=false;if(message)message.textContent='❌ '+e.message+' — لم يتم تسجيل أي تنزيل لهذه الدفعة.';notify(e.message,true)}
  finally{if(b){b.disabled=false;b.textContent='↻ إعادة تنزيل ZIP'}}
 }
 async function confirmPrepared(){
