@@ -111,7 +111,7 @@
 <input id="gallery" type="file" accept="image/*" multiple class="hidden" onchange="picked(event)">
 <input id="excel" type="file" accept=".xlsx,.csv" class="hidden" onchange="importExcel(event)">
 <script>
-let notificationItems=[],unreadNotifications=0,lastReadAt='',firstNotificationPoll=true,notificationsTimer=null,previouslyDownloaded=new Set(),exportPreview=null,preparedBatch=null;
+let notificationItems=[],unreadNotifications=0,lastReadAt='',firstNotificationPoll=true,notificationsTimer=null,previouslyDownloaded=new Set(),exportPreview=null,preparedBatch=null,preparedExpectedCount=0,downloadValidated=false;
 let user=null,csrf='',teachers=[],docs=[],logs=[],users=[],activeTab='home',pickedTeacher=null,pending=[],targetKind='',targetMode='append',targetPage=null,busy=false,searchText='',teacherFilter='all',expectedDocVersion=0,missingSearch='',missingLimit=35,startedMissingSearch='',startedMissingLimit=35;
 let automaticCapture=false,activeScanTeacher=null;
 const kinds={start:'مباشرة العمل',appointment:'قرار التعيين',birth:'شهادة الميلاد',service:'استمرارية العمل',qualification:'المؤهل العلمي'};
@@ -610,25 +610,46 @@ function renderExports(){
  <p class="muted">بعد تنزيل ZIP، أكّد وصوله لهاتفك. في التنزيل التالي ستعرف الجديد والمحدّث والقديم، سواء كان اليوم معلمًا واحدًا أو 100.</p>
  <div class="grid2"><div class="field"><label>نوع الملفات</label><select id="zipStatus" onchange="previewExport()"><option value="all">كل المعلمين</option><option value="complete">المكتمل فقط (5/5)</option><option value="incomplete">الناقص فقط</option></select></div>
  <div class="field"><label>التنظيم داخل ZIP</label><select id="zipFormat" onchange="previewExport()"><option value="folders">مجلد لكل معلم ومستنداته PDF منفصلة</option><option value="pdf">PDF واحد باسم كل معلم</option></select></div>
- <div class="field"><label>ما الذي تريد تنزيله؟</label><select id="zipSelection" onchange="previewExport()"><option value="pending" selected>الجديد والمحدّث فقط (بدون تكرار)</option><option value="all">الكل، حتى ما نزلته سابقًا</option><option value="new">الجديد فقط</option><option value="updated">المحدّث فقط</option><option value="previous">سبق تنزيله فقط (بدون تغيير)</option></select></div>
+ <div class="field"><label>ما الذي تريد تنزيله؟</label><select id="zipSelection" onchange="previewExport()"><option value="pending" selected>الجديد والمحدّث فقط (بدون تكرار)</option><option value="additions">🧩 استكمال النواقص — المصوغات المضافة لاحقًا فقط</option><option value="all">الكل، حتى ما نزلته سابقًا</option><option value="new">الجديد فقط</option><option value="updated">المحدّث فقط</option><option value="previous">سبق تنزيله فقط (بدون تغيير)</option></select></div>
  <div class="field"><label>عدد المعلمين في الدفعة</label><select id="zipCount"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="400">حتى 400</option></select></div>
  <div class="field"><label>بداية الدفعة ضمن القائمة المختارة</label><input id="zipStart" type="number" value="1" min="1"></div></div>
  <div class="export-metrics"><div class="export-metric"><b id="exportNew">—</b><span>جديد</span></div><div class="export-metric"><b id="exportUpdated">—</b><span>محدّث</span></div><div class="export-metric"><b id="exportOld">—</b><span>سبق تنزيله</span></div></div>
- <p id="exportHint" class="small muted">جارٍ فحص الملفات…</p><button class="btn dark full" id="zipDownload" onclick="exportBatch()">⬇ تجهيز تنزيل الأرشيف</button>
- <div class="batch-note small">الفرق بين «مجلدات PDF» و«PDF مجمّع» محفوظ بشكل مستقل. بعد التحميل أكّد وصول الملف حتى لا يُسجَّل تنزيل فاشل.</div>
+ <div class="batch-note" style="background:#eef6fb;border-color:#c9dbe8">🧩 <b>استكمال النواقص:</b> <b id="addedTeachers">—</b> معلم لديه <b id="addedDocuments">—</b> مستند جديد أُضيف بعد آخر تنزيل مؤكد. سيُنزل هذا المستند الجديد فقط داخل مجلد باسم المعلم، ولا يعيد مستنداته القديمة.</div>
+ <p id="exportHint" class="small muted">جارٍ فحص الملفات…</p>
+ <button class="btn secondary full" type="button" onclick="chooseExportAdditions()">🧩 زر استكمال النواقص — تنزيل المستندات المضافة لاحقًا فقط</button>
+ <div style="height:9px"></div><button class="btn dark full" id="zipDownload" onclick="exportBatch()">⬇ تجهيز تنزيل الأرشيف</button>
+ <div class="batch-note small">قبل اعتماد الدفعة، ينشئ الخادم ملف ZIP كاملًا ويفحصه. ويحتوي ZIP على «قائمة_الملفات.csv» لمعرفة عدد المعلمين والمستندات. لا تضغط تأكيد وصول الملف حتى تفتح ZIP وتطابق العدد مع القائمة.</div>
  <button class="btn sm secondary" onclick="markPreviousModal()">لدي ملفات نزلتها قبل هذا التحديث — تسجيلها</button>
+ <button class="btn sm outline" onclick="resetPreviousModal()">ملفات مسجلة كمنزّلة لكنها لم تصل إلى الهاتف — إعادة تعيينها</button>
  </div>`;
  previewExport();
 }
+function chooseExportAdditions(){
+ if(el('zipSelection'))el('zipSelection').value='additions';
+ if(el('zipFormat'))el('zipFormat').value='folders';
+ previewExport();
+}
 async function previewExport(){
- const status=el('zipStatus')?.value||'all',format=el('zipFormat')?.value||'folders';
+ const status=el('zipStatus')?.value||'all';
+ const formatNode=el('zipFormat');
+ const selection=el('zipSelection')?.value||'pending';
+ if(selection==='additions'&&formatNode?.value!=='folders'){
+  formatNode.value='folders';
+  notify('استكمال النواقص ينزّل المستندات المضافة فقط في مجلد المعلم، لذا اختير تنظيم المجلدات.');
+ }
+ const format=formatNode?.value||'folders';
  try{
   const data=await api(`/api/export/preview?status=${encodeURIComponent(status)}&format=${encodeURIComponent(format)}`);
   if(activeTab!=='exports'||el('zipStatus')?.value!==status||el('zipFormat')?.value!==format)return;
   exportPreview=data;
   el('exportNew').textContent=data.summary.new;el('exportUpdated').textContent=data.summary.updated;el('exportOld').textContent=data.summary.previous;
-  let selection=el('zipSelection').value;let eligible=data.items.filter(x=>selection==='all'||(selection==='pending'&&x.download_state!=='previous')||x.download_state===selection);
-  el('exportHint').textContent=`المتاح لهذا الاختيار: ${eligible.length} معلم لديه مستندات. الملفات التي لا تحتوي أي مستند لن تظهر في ZIP.`;
+  el('addedTeachers').textContent=data.summary.additions_teachers||0;
+  el('addedDocuments').textContent=data.summary.additions_documents||0;
+  const eligible=data.items.filter(x=>selection==='all'||
+     (selection==='pending'&&x.download_state!=='previous')||
+     (selection==='additions'&&x.additions_count>0)||x.download_state===selection);
+  const nDocs=selection==='additions'?eligible.reduce((s,x)=>s+x.additions_count,0):0;
+  el('exportHint').textContent=`المتاح لهذا الاختيار: ${eligible.length} معلم${selection==='additions'?' • '+nDocs+' مستند جديد فقط':''}. لا تُرسل المجلدات الفارغة داخل ZIP.`;
   el('zipDownload').disabled=!eligible.length;
  }catch(e){exportPreview=null;if(el('exportHint'))el('exportHint').textContent=e.message;notify(e.message,true)}
 }
@@ -639,19 +660,80 @@ async function exportBatch(){
  try{
   const result=await api('/api/export/prepare',{method:'POST',body:JSON.stringify(payload)});
   preparedBatch=result.batch_id;
-  const path=`/api/export/batch/${encodeURIComponent(result.batch_id)}.zip`;
-  showModal('📦 تنزيل أرشيف المعلمين',`<p class="batch-note">تحتوي هذه الدفعة على <b>${result.count}</b> معلم.<br>جديد: <b>${result.summary.new}</b>، محدّث: <b>${result.summary.updated}</b>، تم تنزيله: <b>${result.summary.previous}</b>.</p>
-  <p class="muted">اضغط «تنزيل ZIP»، وافتح قائمة التنزيلات في هاتفك حتى تتأكد أن الملف وصل كاملًا.</p>
-  <button class="btn dark full" onclick="downloadPrepared()">⬇ تنزيل ملف ZIP إلى الهاتف</button><br><br>
-  <button class="btn primary full" onclick="confirmPrepared()">✅ نعم، وصل الملف لهاتفي كاملًا</button><br><br>
-  <button class="btn secondary full" onclick="closeModal()">لم يصل الملف — لا تسجّل هذه الدفعة</button>`);
+  preparedExpectedCount=result.count;
+  downloadValidated=false;
+  showModal('📦 تنزيل أرشيف المعلمين',`<p class="batch-note"><b>عدد المعلمين في الدفعة: ${result.count}</b> — عدد مستندات PDF: <b>${result.document_count}</b>.<br>الجديد: ${result.summary.new}، المحدّث: ${result.summary.updated}، السابق: ${result.summary.previous}.</p>
+  <p class="muted">سترى ملف ZIP باسم يحتوي رقم <b>${result.count}</b>، وداخل الأرشيف كشفًا «قائمة_الملفات.csv». يتحقق النظام من ZIP كاملًا قبل التنزيل.</p>
+  <button id="startZipDownload" class="btn dark full" onclick="downloadPrepared()">⬇ تنزيل ZIP والتحقق من اكتماله</button>
+  <p id="downloadStatus" class="small muted">لم يبدأ التنزيل بعد.</p>
+  <button id="confirmZipDownload" class="btn primary full" disabled onclick="confirmPrepared()">✅ فحصت ZIP ووصلت ملفات المعلمين كلها للهاتف</button><br><br>
+  <button class="btn secondary full" onclick="closeModal()">لم يصل الملف كاملًا — لا تسجل التنزيل</button>`);
  }catch(e){notify(e.message,true)}finally{b.disabled=false;b.textContent='⬇ تجهيز تنزيل الأرشيف'}
 }
-function downloadPrepared(){if(!preparedBatch)return;getFile(`/api/export/batch/${encodeURIComponent(preparedBatch)}.zip`);notify('افتح التنزيلات وتأكد من وصول ZIP كاملًا قبل الضغط على تأكيد')}
-async function confirmPrepared(){
+function zipEntryCount(blobBytes){
+ const view=new DataView(blobBytes);
+ for(let i=view.byteLength-22;i>=Math.max(0,view.byteLength-65557);i--){
+  if(view.getUint32(i,true)===0x06054b50){
+   const comment=view.getUint16(i+20,true);
+   if(i+22+comment===view.byteLength){return view.getUint16(i+10,true)}
+  }
+ }
+ return -1;
+}
+async function downloadPrepared(){
  if(!preparedBatch)return;
- if(!confirm('هل تأكدت من وصول ملف ZIP كاملًا إلى هاتفك؟'))return;
- try{await api('/api/export/confirm',{method:'POST',body:JSON.stringify({batch_id:preparedBatch})});preparedBatch=null;closeModal();notify('✅ تم تسجيل التنزيل. ستظهر الملفات الجديدة أو المعدلة فقط في المرة القادمة.');await previewExport()}
+ const b=el('startZipDownload'),message=el('downloadStatus');
+ if(b){b.disabled=true;b.textContent='جارٍ إنشاء ZIP والتحقق منه…'}
+ if(message)message.textContent='قد يستغرق تحميل عشرات الصور بعض الوقت؛ لا تغلق هذه الصفحة.';
+ downloadValidated=false;
+ try{
+  const r=await fetch(`/api/export/batch/${encodeURIComponent(preparedBatch)}.zip`,{credentials:'same-origin',cache:'no-store'});
+  if(!r.ok){const err=await r.json().catch(()=>({}));throw Error(err.error||`تعذر إنشاء الأرشيف: ${r.status}`)}
+  const expectedTeachers=Number(r.headers.get('X-Archive-Teachers'));
+  const expectedEntries=Number(r.headers.get('X-Archive-Entries'));
+  const expectedBytes=Number(r.headers.get('Content-Length'));
+  const blob=await r.blob();
+  if(expectedTeachers!==preparedExpectedCount||!expectedEntries||!expectedBytes||blob.size!==expectedBytes){
+   throw Error('تنزيل غير مكتمل: عدد المعلمين أو حجم ZIP لا يطابق الكشف. لا تؤكد هذه الدفعة.')
+  }
+  // Check the ZIP central directory was received, not just the HTTP status.
+  const tail=await blob.slice(Math.max(0,blob.size-65557)).arrayBuffer();
+  const count=zipEntryCount(tail);
+  if(count!==expectedEntries)throw Error('نهاية ZIP مفقودة أو عدد الملفات لا يطابق الكشف؛ أعد التنزيل.')
+  const objectUrl=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=objectUrl;a.download=`school_archive_${preparedExpectedCount}_teachers_${new Date().toISOString().slice(0,10)}.zip`;
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(objectUrl),120000);
+  downloadValidated=true;
+  if(el('confirmZipDownload'))el('confirmZipDownload').disabled=false;
+  if(message)message.textContent=`✅ تم التحقق من ZIP: ${preparedExpectedCount} معلم، ${expectedEntries-1} ملف PDF، وحجمه ${(blob.size/1024/1024).toFixed(2)} MB. افتح الملف وتأكد من وصوله قبل التأكيد.`;
+  notify(`تم تجهيز ZIP كاملًا لعدد ${preparedExpectedCount} معلم. افحصه داخل الهاتف قبل التأكيد.`);
+ }catch(e){downloadValidated=false;if(message)message.textContent='❌ '+e.message;notify(e.message,true)}
+ finally{if(b){b.disabled=false;b.textContent='↻ إعادة تنزيل ZIP'}}
+}
+async function confirmPrepared(){
+ if(!preparedBatch||!downloadValidated){notify('نزّل ZIP كاملًا أولًا وتحقق من محتوياته قبل التأكيد.',true);return}
+ if(!confirm(`هل فتحت ZIP ووجدت ملفات ${preparedExpectedCount} معلم الموجودة في قائمة_الملفات.csv؟`))return;
+ try{await api('/api/export/confirm',{method:'POST',body:JSON.stringify({batch_id:preparedBatch})});preparedBatch=null;downloadValidated=false;closeModal();notify('✅ تم تسجيل الدفعة بعد التحقق. ستظهر الإضافات والمستندات المعدّلة لاحقًا.');await previewExport()}
+ catch(e){notify(e.message,true)}
+}
+
+function resetPreviousModal(){
+ if(!exportPreview)return notify('افتح التصدير حتى تظهر قائمة المعلمين أولًا',true);
+ previouslyDownloaded=new Set();
+ const fmt=el('zipFormat').value;
+ showModal('إعادة تعيين تنزيل لم يصل إلى الهاتف',`<p class="red">هذا لا يحذف أي مستند من الأرشيف. يعيد المعلم المختار إلى حالة «جديد» لتتمكن من تنزيله من جديد إذا لم يصل ملفه سابقًا.</p>
+ <div class="field"><label>ابحث عن المعلمين الذين لم تصل ملفاتهم</label><input id="previousSearch" class="search" oninput="drawPreviousItems()" placeholder="ابحث بالاسم"></div>
+ <div class="between"><span id="previousCount">0 محدد</span><button class="btn sm secondary" onclick="checkVisiblePrevious()">تحديد النتائج الظاهرة</button></div>
+ <div id="previousList" class="previous-select"></div><br>
+ <button class="btn danger full" onclick="resetSelectedDownloads('${fmt}')">إعادة اعتبار المحدد «لم يُنزّل»</button>`);
+ drawPreviousItems();
+}
+async function resetSelectedDownloads(fmt){
+ if(!previouslyDownloaded.size)return notify('حدد المعلمين الذين لم تصل ملفاتهم إلى الهاتف',true);
+ if(!confirm(`إعادة اعتبار ملفات ${previouslyDownloaded.size} معلم «لم تُنزّل»؟ لن تُحذف المستندات.`))return;
+ try{const data=await api('/api/export/reset',{method:'POST',body:JSON.stringify({teacher_ids:[...previouslyDownloaded],format:fmt})});closeModal();notify(`تمت إعادة ${data.count} معلم إلى قائمة الملفات الجديدة`);await previewExport()}
  catch(e){notify(e.message,true)}
 }
 function markPreviousModal(){
