@@ -611,7 +611,7 @@ function renderExports(){
  <div class="grid2"><div class="field"><label>نوع الملفات</label><select id="zipStatus" onchange="previewExport()"><option value="all">كل المعلمين</option><option value="complete">المكتمل فقط (5/5)</option><option value="incomplete">الناقص فقط</option></select></div>
  <div class="field"><label>التنظيم داخل ZIP</label><select id="zipFormat" onchange="previewExport()"><option value="folders">مجلد لكل معلم ومستنداته PDF منفصلة</option><option value="pdf">PDF واحد باسم كل معلم</option></select></div>
  <div class="field"><label>ما الذي تريد تنزيله؟</label><select id="zipSelection" onchange="previewExport()"><option value="pending" selected>الجديد والمحدّث فقط (بدون تكرار)</option><option value="additions">🧩 استكمال النواقص — المصوغات المضافة لاحقًا فقط</option><option value="all">الكل، حتى ما نزلته سابقًا</option><option value="new">الجديد فقط</option><option value="updated">المحدّث فقط</option><option value="previous">سبق تنزيله فقط (بدون تغيير)</option></select></div>
- <div class="field"><label>عدد المعلمين في الدفعة</label><select id="zipCount"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="400">حتى 400</option></select></div>
+ <div class="field"><label>عدد المعلمين في الدفعة</label><select id="zipCount"><option value="5">5</option><option value="10">10</option><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="400">حتى 400</option></select></div>
  <div class="field"><label>بداية الدفعة ضمن القائمة المختارة</label><input id="zipStart" type="number" value="1" min="1"></div></div>
  <div class="export-metrics">
   <button type="button" class="export-metric" onclick="showExportMetric('new')" title="اعرض أسماء المعلمين الجدد"><b id="exportNew">—</b><span>جديد</span></button>
@@ -624,7 +624,7 @@ function renderExports(){
  <p id="exportHint" class="small muted">جارٍ فحص الملفات…</p>
  <button class="btn secondary full" type="button" onclick="chooseExportAdditions()">🧩 زر استكمال النواقص — تنزيل المستندات المضافة لاحقًا فقط</button>
  <div style="height:9px"></div><button class="btn dark full" id="zipDownload" onclick="exportBatch()">⬇ تجهيز تنزيل الأرشيف</button>
- <div class="batch-note small">قبل اعتماد الدفعة، ينشئ الخادم ملف ZIP كاملًا ويفحصه. ويحتوي ZIP على «قائمة_الملفات.csv» لمعرفة عدد المعلمين والمستندات. لا تضغط تأكيد وصول الملف حتى تفتح ZIP وتطابق العدد مع القائمة.</div>
+ <div class="batch-note small">قبل اعتماد الدفعة، ينشئ الخادم ملف ZIP كاملًا ويفحصه. ويحتوي ZIP على «قائمة_الملفات.csv» لمعرفة عدد المعلمين والمستندات. عند تغيير مستند بعد تجهيز الدفعة يسحب الخادم أحدث نسخة محفوظة قبل التغليف. لا تضغط تأكيد وصول الملف حتى تفتح ZIP وتطابق العدد مع القائمة.</div>
  <button class="btn sm secondary" onclick="markPreviousModal()">لدي ملفات نزلتها قبل هذا التحديث — تسجيلها</button>
  <button class="btn sm outline" onclick="resetPreviousModal()">ملفات مسجلة كمنزّلة لكنها لم تصل إلى الهاتف — إعادة تعيينها</button>
  </div>`;
@@ -735,7 +735,23 @@ async function downloadPrepared(){
   const expectedTeachers=Number(r.headers.get('X-Archive-Teachers'));
   const expectedEntries=Number(r.headers.get('X-Archive-Entries'));
   const expectedBytes=Number(r.headers.get('Content-Length'));
-  const blob=await r.blob();
+  let blob;
+  if(r.body && expectedBytes>0){
+   const reader=r.body.getReader(),parts=[];let received=0;
+   try{
+    while(true){
+     const {done,value}=await reader.read();
+     if(done)break;
+     received+=value.byteLength;
+     if(received>expectedBytes)throw Error('وصلت بيانات أكثر من الحجم المتوقع، أُوقف التنزيل للحماية.');
+     parts.push(value);
+     if(message)message.textContent=`📥 وصول ZIP إلى الهاتف: ${Math.min(100,Math.round(100*received/expectedBytes))}% — لا تغلق الصفحة.`;
+    }
+   }finally{reader.releaseLock()}
+   blob=new Blob(parts,{type:'application/zip'});
+  }else{
+   blob=await r.blob();
+  }
   if(expectedTeachers!==preparedExpectedCount||!expectedEntries||!expectedBytes||blob.size!==expectedBytes){
    throw Error('تنزيل غير مكتمل: عدد المعلمين أو حجم ZIP لا يطابق الكشف. لا تؤكد هذه الدفعة.')
   }
